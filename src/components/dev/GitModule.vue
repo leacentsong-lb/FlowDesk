@@ -1,0 +1,2335 @@
+<script setup>
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+
+// ============================================
+// 状态定义
+// ============================================
+
+// Broker 项目路径
+const brokerPaths = ref(JSON.parse(localStorage.getItem('broker_project_paths') || '{}'))
+const githubToken = ref(localStorage.getItem('github_token') || '')
+const currentGitHubUser = ref('')
+
+// 仓库状态
+const repoStatuses = reactive({})
+// 分支切换 UI 状态（每仓库独立）
+const branchUI = reactive({}) // key -> { open, query, branches, loading }
+const loadingRepos = ref(new Set())
+const repoErrors = ref({})
+// 列表页 PR 摘要（轻量，仅与你相关）
+const prSummary = reactive({}) // key -> { loading, mine, review }
+
+// Repo 详情页（按需加载：分支/同步/提交/PR）
+const showRepoDetailsPage = ref(false)
+const repoDetailTab = ref('overview') // overview | prs
+const repoDetail = reactive({
+  repoKey: '',
+  repoPath: '',
+  repoName: '',
+  loading: false,
+  error: '',
+  // git status
+  currentBranch: '',
+  workingTree: null,
+  // sync
+  currentStatus: null,
+  latestStatus: null,
+  // commits
+  recentCommits: [],
+  // remote
+  remoteInfo: '',
+  // PRs (lazy)
+  prsLoaded: false,
+  prsLoading: false,
+  prsError: '',
+  prs: [],
+  prSearch: '',
+  prOnlyAssignedToMe: false
+})
+
+// Merge Modal
+const showMergeModal = ref(false)
+const mergeTarget = ref({
+  repoKey: '',
+  repoPath: '',
+  repoName: '',
+  sourceBranch: 'latest',
+  targetBranch: '',
+  branches: [],
+  query: '',
+  open: false
+})
+const merging = ref(false)
+const mergeResult = ref(null)
+
+const initReposLoading = ref(false)
+
+// ============================================
+// 计算属性
+// ============================================
+
+const brokerList = computed(() => Object.entries(brokerPaths.value))
+const hasRepos = computed(() => brokerList.value.length > 0)
+
+const normalize = (s) => (s || '').toString().trim().toLowerCase()
+
+const isAssignedToMeFallback = (pr) => {
+  // 主匹配：GitHub login
+  const me = normalize(currentGitHubUser.value)
+  if (me) {
+    return pr.reviewers?.some(r => normalize(r.login) === me) || false
+  }
+  // 兜底：git config user.name 模糊匹配 reviewer login
+  const gn = normalize(gitGlobalUser.value?.name)
+  if (!gn) return false
+  const tokens = gn.split(/\s+/).filter(Boolean)
+  return pr.reviewers?.some(r => tokens.some(t => normalize(r.login).includes(t))) || false
+}
+
+const filteredRepoPRs = computed(() => {
+  const q = normalize(repoDetail.prSearch)
+  let list = repoDetail.prs || []
+  if (repoDetail.prOnlyAssignedToMe) {
+    list = list.filter(pr => pr.needsMyReview || isAssignedToMeFallback(pr))
+  }
+  if (q) {
+    list = list.filter(pr => (
+      normalize(pr.title).includes(q) ||
+      normalize(pr.base).includes(q) ||
+      normalize(pr.head).includes(q) ||
+      normalize(pr.author).includes(q)
+    ))
+  }
+  return list
+})
+
+// Broker 主题色：为不同仓库提供可区分的视觉标识（不依赖主题，仅做 accent）
+const hashString = (s) => {
+  let h = 0
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0
+  return h
+}
+
+const brokerStyle = (key) => {
+  const k = (key || '').toString().toLowerCase()
+  // TMGM 强化：固定更高对比度的青色系（与 Cyber Night 主色也一致）
+  if (k === 'tmgm') {
+    return {
+      '--broker-color': 'hsl(188 100% 52%)',
+      '--broker-color-bg': 'hsla(188, 100%, 52%, 0.18)',
+      '--broker-color-glow': 'hsla(188, 100%, 52%, 0.35)'
+    }
+  }
+  const hue = hashString(k) % 360
+  return {
+    '--broker-color': `hsl(${hue} 78% 52%)`,
+    '--broker-color-bg': `hsla(${hue}, 78%, 52%, 0.16)`,
+    '--broker-color-glow': `hsla(${hue}, 78%, 52%, 0.28)`
+  }
+}
+
+// ============================================
+// 方法
+// ============================================
+
+// 从路径提取仓库名
+const getRepoName = (path) => {
+  const parts = path.split('/')
+  return parts[parts.length - 1] || path
+}
+
+// 获取单个仓库状态
+const ensureBranchUI = (key) => {
+  if (!branchUI[key]) {
+    branchUI[key] = { open: false, query: '', branches: [], loading: false }
+  }
+}
+
+const fetchRepoBranches = async (key, path) => {
+  ensureBranchUI(key)
+  if (branchUI[key].branches.length > 0 || branchUI[key].loading) return
+  branchUI[key].loading = true
+  try {
+    const branches = await invoke('git_list_branches', { projectPath: path })
+    // 仅保留本地分支（去掉 remotes/ 等）
+    branchUI[key].branches = branches
+      .map(b => b.replace('* ', '').trim())
+      .filter(b => b && !b.includes('remotes/') && !b.includes('origin/') && !b.includes('HEAD'))
+  } catch (e) {
+    // 不阻断主流程
+  } finally {
+    branchUI[key].loading = false
+  }
+}
+
+const fetchRepoStatus = async (key, path) => {
+  loadingRepos.value.add(key)
+  repoErrors.value[key] = ''
+  
+  try {
+    // 首屏仅加载轻量状态：当前分支 + 工作区（避免同时跑分支/commit/sync 导致卡顿）
+    const [currentBranch, workingTree] = await Promise.all([
+      invoke('git_current_branch', { projectPath: path }),
+      invoke('git_check_working_tree', { projectPath: path })
+    ])
+    
+    repoStatuses[key] = {
+      path,
+      name: getRepoName(path),
+      currentBranch,
+      workingTree,
+      lastUpdated: new Date()
+    }
+  } catch (e) {
+    repoErrors.value[key] = e.toString()
+    repoStatuses[key] = null
+  } finally {
+    loadingRepos.value.delete(key)
+  }
+}
+
+// 列表页：按需加载“与你相关 PR”摘要（不拉全量详情）
+const fetchRepoPRSummary = async (key, path) => {
+  if (!githubToken.value) return
+  if (prSummary[key]?.loading) return
+  prSummary[key] = { loading: true, mine: 0, review: 0 }
+  try {
+    const repoInfo = await invoke('git_get_remote_info', { projectPath: path }).catch(() => '')
+    const normalized = (repoInfo || '').trim().replace(/\.git$/i, '')
+    const [owner, repo] = normalized.split('/').filter(Boolean)
+    if (!owner || !repo) {
+      prSummary[key] = { loading: false, mine: 0, review: 0 }
+      return
+    }
+    const result = await invoke('github_list_open_prs', { owner, repo, token: githubToken.value })
+    if (result.status !== 200) {
+      prSummary[key] = { loading: false, mine: 0, review: 0 }
+      return
+    }
+    const prs = JSON.parse(result.body || '[]') || []
+    const me = normalize(currentGitHubUser.value)
+    const mine = prs.filter(pr => normalize(pr.user?.login) === me).length
+    const review = prs.filter(pr => (pr.requested_reviewers || []).some(r => normalize(r.login) === me)).length
+    prSummary[key] = { loading: false, mine, review }
+  } catch {
+    prSummary[key] = { loading: false, mine: 0, review: 0 }
+  }
+}
+
+const schedulePRSummaryPrefetch = () => {
+  if (!githubToken.value) return
+  // 避免同时打多个请求：逐个串行
+  let i = 0
+  const list = brokerList.value.slice(0)
+  const tick = async () => {
+    const item = list[i]
+    if (!item) return
+    const [key, path] = item
+    await fetchRepoPRSummary(key, path)
+    i++
+    setTimeout(tick, 150)
+  }
+  setTimeout(tick, 300)
+}
+// 切换分支（安全校验通过才允许）
+const checkoutBranch = async (key, path, branch) => {
+  // 根除“点了没动作”：不依赖 repoStatuses（可能尚未刷新/为空），而是现场做安全校验
+  let wt = null
+  try {
+    wt = await invoke('git_check_working_tree', { projectPath: path })
+  } catch (e) {}
+
+  const clean = wt?.clean ?? true
+  const hasTrackedChanges = (wt?.stagedFiles?.length > 0) || (wt?.unstagedFiles?.length > 0)
+  if (!clean && hasTrackedChanges) {
+    repoErrors.value[key] = '⚠️ 工作区有未提交的更改，禁止切换分支'
+    return
+  }
+
+  const current = showRepoDetailsPage.value && repoDetail.repoKey === key
+    ? repoDetail.currentBranch
+    : (repoStatuses[key]?.currentBranch || '')
+  if (branch === current) {
+    ensureBranchUI(key)
+    branchUI[key].open = false
+    return
+  }
+
+  loadingRepos.value.add(key)
+  repoErrors.value[key] = ''
+  try {
+    await invoke('git_checkout_branch', { projectPath: path, branch })
+    // 刷新轻量卡片
+    await fetchRepoStatus(key, path)
+    // 刷新详情页 Stage A
+    if (showRepoDetailsPage.value && repoDetail.repoKey === key) {
+      repoDetail.loading = true
+      repoDetail.error = ''
+      setTimeout(() => openRepoDetails(key, path), 0)
+    }
+  } catch (e) {
+    repoErrors.value[key] = e.toString()
+  } finally {
+    loadingRepos.value.delete(key)
+    ensureBranchUI(key)
+    branchUI[key].open = false
+    branchUI[key].query = ''
+  }
+}
+
+// Pull 当前分支（仅在落后且安全校验通过时允许）
+const pullCurrentBranch = async (key, path) => {
+  if (!repoStatuses[key]) return
+  const branch = repoStatuses[key].currentBranch
+  if (!repoStatuses[key].workingTree?.clean) {
+    repoErrors.value[key] = '⚠️ 工作区有未提交的更改，禁止 pull'
+    return
+  }
+  loadingRepos.value.add(key)
+  repoErrors.value[key] = ''
+  try {
+    await invoke('git_pull_branch', { projectPath: path, branch })
+    await fetchRepoStatus(key, path)
+  } catch (e) {
+    repoErrors.value[key] = e.toString()
+  } finally {
+    loadingRepos.value.delete(key)
+    if (showRepoDetailsModal.value && repoDetail.repoKey === key) {
+      openRepoDetails(key, path)
+    }
+  }
+}
+
+// 刷新所有仓库状态
+const refreshAllRepos = async () => {
+  const promises = brokerList.value.map(([key, path]) => 
+    fetchRepoStatus(key, path)
+  )
+  await Promise.all(promises)
+}
+
+// Fetch 单个仓库
+const fetchRepo = async (key, path) => {
+  loadingRepos.value.add(key)
+  try {
+    await invoke('git_fetch', { projectPath: path })
+    await fetchRepoStatus(key, path)
+  } catch (e) {
+    repoErrors.value[key] = `Fetch 失败: ${e}`
+  } finally {
+    loadingRepos.value.delete(key)
+  }
+}
+
+// 打开仓库详情（点击单个仓库后再加载重信息）
+const openRepoDetails = async (key, path) => {
+  repoDetail.repoKey = key
+  repoDetail.repoPath = path
+  repoDetail.repoName = getRepoName(path)
+  repoDetailTab.value = 'overview'
+  repoDetail.loading = true
+  repoDetail.error = ''
+  repoDetail.currentBranch = ''
+  repoDetail.workingTree = null
+  repoDetail.currentStatus = null
+  repoDetail.latestStatus = null
+  repoDetail.recentCommits = []
+  repoDetail.remoteInfo = ''
+  repoDetail.prsLoaded = false
+  repoDetail.prsLoading = false
+  repoDetail.prsError = ''
+  repoDetail.prs = []
+  repoDetail.prSearch = ''
+  repoDetail.prOnlyAssignedToMe = false
+  // 先“进页面”再请求，避免点击后等待导致不响应
+  showRepoDetailsPage.value = true
+
+  // 分阶段加载：A(分支+工作区) -> B(sync) -> C(commits)；每阶段都让 UI 先渲染再请求
+  setTimeout(async () => {
+    try {
+      // Stage A
+      const [currentBranch, workingTree, remoteInfo] = await Promise.all([
+        invoke('git_current_branch', { projectPath: path }),
+        invoke('git_check_working_tree', { projectPath: path }),
+        invoke('git_get_remote_info', { projectPath: path }).catch(() => '')
+      ])
+      repoDetail.currentBranch = currentBranch
+      repoDetail.workingTree = workingTree
+      repoDetail.remoteInfo = remoteInfo
+      repoDetail.loading = false
+
+      // 先把轻量卡片同步刷新掉（避免 UI 仍显示旧分支）
+      fetchRepoStatus(key, path)
+
+      // Stage B（sync）与 Stage C（commits）再异步加载，避免进入详情时卡顿体感
+      setTimeout(async () => {
+        const [currentStatus, latestStatus] = await Promise.all([
+          invoke('git_check_behind_ahead', { projectPath: path, branch: currentBranch }).catch(() => null),
+          invoke('git_check_behind_ahead', { projectPath: path, branch: 'latest' }).catch(() => null)
+        ])
+        repoDetail.currentStatus = currentStatus
+        repoDetail.latestStatus = latestStatus
+      }, 0)
+
+      setTimeout(async () => {
+        const commits = await invoke('git_get_recent_commits', { projectPath: path, count: 5 }).catch(() => ({ commits: [] }))
+        repoDetail.recentCommits = commits?.commits || []
+      }, 0)
+    } catch (e) {
+      repoDetail.error = e.toString()
+      repoDetail.loading = false
+    }
+  }, 0)
+}
+
+const closeRepoDetails = () => {
+  showRepoDetailsPage.value = false
+}
+
+// 打开 Merge Modal
+const openMergeModal = async (key, path, name) => {
+  mergeTarget.value = {
+    repoKey: key,
+    repoPath: path,
+    repoName: name,
+    sourceBranch: 'latest',
+    targetBranch: '',
+    branches: [],
+    query: '',
+    open: false
+  }
+  mergeResult.value = null
+  
+  // 获取分支列表
+  try {
+    const branches = await invoke('git_list_branches', { projectPath: path })
+    mergeTarget.value.branches = branches
+      .filter(b => !b.includes('remotes/') && b !== 'latest')
+      .map(b => b.replace('* ', '').trim())
+  } catch (e) {
+    console.error('Failed to list branches:', e)
+  }
+  
+  showMergeModal.value = true
+}
+
+// 执行 Merge
+const executeMerge = async () => {
+  if (!mergeTarget.value.targetBranch) return
+  
+  merging.value = true
+  mergeResult.value = null
+  
+  try {
+    const result = await invoke('git_merge_branch', {
+      projectPath: mergeTarget.value.repoPath,
+      sourceBranch: mergeTarget.value.sourceBranch,
+      targetBranch: mergeTarget.value.targetBranch
+    })
+    
+    mergeResult.value = result
+    
+    // 刷新仓库状态
+    if (result.success) {
+      await fetchRepoStatus(mergeTarget.value.repoKey, mergeTarget.value.repoPath)
+    }
+  } catch (e) {
+    mergeResult.value = { success: false, message: e.toString() }
+  } finally {
+    merging.value = false
+  }
+}
+
+// 关闭 Merge Modal
+const closeMergeModal = () => {
+  showMergeModal.value = false
+  mergeTarget.value = {
+    repoKey: '',
+    repoPath: '',
+    repoName: '',
+    sourceBranch: 'latest',
+    targetBranch: '',
+    branches: [],
+    query: '',
+    open: false
+  }
+  mergeResult.value = null
+}
+
+// ============================================
+// PR 相关方法
+// ============================================
+
+// 获取当前 GitHub 用户
+const fetchCurrentUser = async () => {
+  if (!githubToken.value) return
+  
+  try {
+    const result = await invoke('github_get_current_user', { 
+      token: githubToken.value 
+    })
+    if (result.status === 200) {
+      const user = JSON.parse(result.body)
+      currentGitHubUser.value = user.login
+    }
+  } catch (e) {
+    console.error('Failed to get GitHub user:', e)
+  }
+}
+
+// 获取 git global user（作为 reviewer name 匹配兜底）
+const gitGlobalUser = ref({ name: '', email: '' })
+const fetchGitGlobalUser = async () => {
+  try {
+    const result = await invoke('git_get_global_user')
+    gitGlobalUser.value = result || { name: '', email: '' }
+  } catch (e) {}
+}
+
+// 获取当前仓库的 PR（在仓库详情里按需加载）
+const fetchRepoPRs = async () => {
+  if (!githubToken.value) {
+    repoDetail.prsError = '请先在设置中配置 GitHub Token'
+    return
+  }
+  if (!repoDetail.remoteInfo) {
+    repoDetail.prsError = '未找到 GitHub remote 信息（请检查 origin 是否指向 GitHub）'
+    return
+  }
+
+  const [owner, repo] = repoDetail.remoteInfo.split('/')
+  if (!owner || !repo) {
+    repoDetail.prsError = 'GitHub remote 解析失败'
+    return
+  }
+
+  repoDetail.prsLoading = true
+  repoDetail.prsError = ''
+  repoDetail.prs = []
+
+  try {
+    const result = await invoke('github_list_open_prs', {
+      owner,
+      repo,
+      token: githubToken.value
+    })
+
+    if (result.status === 200) {
+      const prs = JSON.parse(result.body)
+      repoDetail.prs = (prs || []).map(pr => ({
+        id: pr.id,
+        number: pr.number,
+        title: pr.title,
+        url: pr.html_url,
+        state: pr.state,
+        draft: pr.draft,
+        base: pr.base?.ref || '',
+        head: pr.head?.ref || '',
+        author: pr.user?.login || '',
+        authorAvatar: pr.user?.avatar_url || '',
+        reviewers: pr.requested_reviewers?.map(r => ({
+          login: r.login,
+          avatar: r.avatar_url
+        })) || [],
+        createdAt: pr.created_at,
+        updatedAt: pr.updated_at,
+        isAuthor: pr.user?.login === currentGitHubUser.value,
+        needsMyReview: pr.requested_reviewers?.some(r => r.login === currentGitHubUser.value) || false
+      })).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+      repoDetail.prsLoaded = true
+    } else {
+      repoDetail.prsError = `获取 PR 失败: HTTP ${result.status}`
+    }
+  } catch (e) {
+    repoDetail.prsError = `获取 PR 失败: ${e}`
+  } finally {
+    repoDetail.prsLoading = false
+  }
+}
+
+// 打开 PR 链接
+const openPR = (url) => {
+  invoke('open_url_raw', { url })
+}
+
+// 格式化时间
+const formatTime = (dateStr) => {
+  if (!dateStr) return ''
+  const date = new Date(dateStr)
+  const now = new Date()
+  const diff = now - date
+  
+  if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)} 小时前`
+  if (diff < 604800000) return `${Math.floor(diff / 86400000)} 天前`
+  return date.toLocaleDateString('zh-CN')
+}
+
+// ============================================
+// 事件监听
+// ============================================
+
+const handleBrokerPathsUpdated = (event) => {
+  brokerPaths.value = event.detail
+  refreshAllRepos()
+}
+
+const handleGithubTokenUpdated = (event) => {
+  githubToken.value = event.detail
+  if (event.detail) {
+    fetchCurrentUser()
+    // token 更新后刷新 PR 摘要
+    schedulePRSummaryPrefetch()
+  }
+}
+
+// ============================================
+// 生命周期
+// ============================================
+
+onMounted(async () => {
+  window.addEventListener('broker-paths-updated', handleBrokerPathsUpdated)
+  window.addEventListener('github-token-updated', handleGithubTokenUpdated)
+  
+  // 初始化
+  // 不阻塞首屏渲染：这些初始化异步串行会让 UI 看起来“卡住”
+  setTimeout(() => {
+    fetchGitGlobalUser()
+    if (githubToken.value) fetchCurrentUser()
+  }, 0)
+
+  if (hasRepos.value) {
+    initReposLoading.value = true
+    // 让 UI 先渲染出 skeleton，再开始并行拉取各仓库状态
+    setTimeout(async () => {
+      try {
+        await refreshAllRepos()
+      } finally {
+        initReposLoading.value = false
+        schedulePRSummaryPrefetch()
+      }
+    }, 0)
+  }
+})
+
+onUnmounted(() => {
+  window.removeEventListener('broker-paths-updated', handleBrokerPathsUpdated)
+  window.removeEventListener('github-token-updated', handleGithubTokenUpdated)
+})
+
+</script>
+
+<template>
+  <div class="git-module">
+    <!-- 顶部导航 -->
+    <div class="module-header">
+      <div class="module-title">
+        <span class="tab-icon">🔀</span>
+        <span>Git 仓库</span>
+        <span class="tab-count" v-if="brokerList.length">{{ brokerList.length }}</span>
+      </div>
+      
+      <div class="header-actions">
+        <button 
+          class="refresh-btn" 
+          @click="refreshAllRepos()"
+          :disabled="loadingRepos.size > 0 || initReposLoading"
+        >
+          <span :class="{ spinning: loadingRepos.size > 0 || initReposLoading }">🔄</span>
+        </button>
+      </div>
+    </div>
+    
+    <!-- 仓库状态（轻量） -->
+    <div v-if="!showRepoDetailsPage" class="repos-view">
+      <!-- 无仓库提示 -->
+      <div v-if="!hasRepos" class="empty-state">
+        <div class="empty-icon">📂</div>
+        <h3>未配置项目仓库</h3>
+        <p>请在全局设置中添加项目路径</p>
+      </div>
+
+      <!-- 初始化加载态：避免空白/误判未配置，同时不阻塞整个 App -->
+      <div v-else-if="initReposLoading" class="init-loading">
+        <div class="init-loading-bar">
+          <div class="init-loading-dot"></div>
+          <div class="init-loading-text">正在初始化仓库状态...</div>
+        </div>
+        <div class="repo-grid skeleton-grid">
+          <div v-for="n in Math.min(6, brokerList.length)" :key="n" class="repo-card skeleton">
+            <div class="card-header">
+              <div class="repo-identity">
+                <span class="broker-badge skeleton-pill">----</span>
+                <div class="skeleton-line w-200"></div>
+              </div>
+              <div class="skeleton-icon"></div>
+            </div>
+            <div class="card-content">
+              <div class="skeleton-row">
+                <div class="skeleton-line w-120"></div>
+                <div class="skeleton-line w-140"></div>
+              </div>
+              <div class="skeleton-row">
+                <div class="skeleton-line w-120"></div>
+                <div class="skeleton-line w-180"></div>
+              </div>
+              <div class="skeleton-row">
+                <div class="skeleton-line w-120"></div>
+                <div class="skeleton-line w-140"></div>
+              </div>
+              <div class="card-footer">
+                <div class="skeleton-btn"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- 仓库卡片网格 -->
+      <div v-else class="repo-grid">
+        <div 
+          v-for="[key, path] in brokerList" 
+          :key="key"
+          class="repo-card"
+          :style="brokerStyle(key)"
+          :class="{ 
+            loading: loadingRepos.has(key),
+            error: repoErrors[key],
+            'has-changes': repoStatuses[key]?.workingTree && !repoStatuses[key]?.workingTree.clean,
+            'is-tmgm': key.toLowerCase() === 'tmgm'
+          }"
+        >
+          <!-- 卡片头部 -->
+          <div class="card-header">
+            <div class="repo-identity">
+              <span class="broker-badge">{{ key.toUpperCase() }}</span>
+              <h4 class="repo-name">{{ getRepoName(path) }}</h4>
+            </div>
+            <div class="card-actions">
+              <button 
+                class="action-btn" 
+                title="Fetch"
+                @click="fetchRepo(key, path)"
+                :disabled="loadingRepos.has(key)"
+              >
+                <span :class="{ spinning: loadingRepos.has(key) }">⬇️</span>
+              </button>
+            </div>
+          </div>
+          
+          <!-- 加载状态 -->
+          <div v-if="loadingRepos.has(key) && !repoStatuses[key]" class="card-loading">
+            <div class="mini-spinner"></div>
+            <span>加载中...</span>
+          </div>
+          
+          <!-- 错误状态 -->
+          <div v-else-if="repoErrors[key]" class="card-error">
+            <span class="error-icon">⚠️</span>
+            <span class="error-text">{{ repoErrors[key] }}</span>
+          </div>
+          
+          <!-- 仓库信息 -->
+          <div v-else-if="repoStatuses[key]" class="card-content">
+            <!-- 当前分支（轻量展示） -->
+            <div class="info-row branch-row">
+              <span class="info-label">🌿 当前分支</span>
+              <span class="branch-name">{{ repoStatuses[key].currentBranch }}</span>
+            </div>
+            
+            <!-- 工作区状态 -->
+            <div class="info-row status-row">
+              <span class="info-label">📝 工作区</span>
+              <span 
+                class="status-badge"
+                :class="repoStatuses[key].workingTree.clean ? 'clean' : 'dirty'"
+              >
+                {{ repoStatuses[key].workingTree.clean ? '✓ 干净' : repoStatuses[key].workingTree.summary }}
+              </span>
+            </div>
+
+            <!-- PR 摘要（与你相关） -->
+            <div class="info-row pr-row">
+              <span class="info-label">🔀 PR</span>
+              <div class="pr-summary">
+                <span v-if="prSummary[key]?.loading" class="mini-muted">加载中...</span>
+                <template v-else>
+                  <span class="pr-chip mine">我的 {{ prSummary[key]?.mine ?? 0 }}</span>
+                  <span class="pr-chip review">待我 Review {{ prSummary[key]?.review ?? 0 }}</span>
+                </template>
+              </div>
+            </div>
+
+            <!-- 操作按钮（进入详情再加载更多信息） -->
+            <div class="card-footer">
+              <button 
+                class="merge-btn"
+                @click="openRepoDetails(key, path)"
+              >
+                查看详情
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- 仓库详情页（点击仓库后再加载重信息 & PR） -->
+    <div v-else class="repo-details-page" :style="brokerStyle(repoDetail.repoKey)">
+      <div class="details-header">
+        <button class="back-btn" @click="closeRepoDetails">← 返回</button>
+        <div class="details-title">
+          <span class="broker-badge">{{ repoDetail.repoKey.toUpperCase() }}</span>
+          <span class="repo-title">{{ repoDetail.repoName }}</span>
+        </div>
+      </div>
+
+      <div class="details-body">
+        <div class="detail-tabs">
+          <button class="detail-tab" :class="{ active: repoDetailTab === 'overview' }" @click="repoDetailTab = 'overview'">概览</button>
+          <button class="detail-tab" :class="{ active: repoDetailTab === 'prs' }" @click="repoDetailTab = 'prs'; if (!repoDetail.prsLoaded && !repoDetail.prsLoading) fetchRepoPRs()">Pull Requests</button>
+        </div>
+
+        <div v-if="repoDetail.loading" class="loading-state">
+          <div class="spinner"></div>
+          <span>加载仓库详情...</span>
+        </div>
+        <div v-else-if="repoDetail.error" class="error-state">
+          <span class="error-icon">⚠️</span>
+          <span>{{ repoDetail.error }}</span>
+        </div>
+
+        <template v-else>
+          <div v-if="repoDetailTab === 'overview'" class="detail-section">
+            <div class="info-row">
+              <span class="info-label">🌿 当前分支</span>
+              <div class="branch-switch">
+                <button
+                  class="branch-pill"
+                  :disabled="!repoDetail.workingTree?.clean"
+                  @click="ensureBranchUI(repoDetail.repoKey); fetchRepoBranches(repoDetail.repoKey, repoDetail.repoPath); branchUI[repoDetail.repoKey].open = !branchUI[repoDetail.repoKey].open"
+                  :title="!repoDetail.workingTree?.clean ? '工作区有未提交更改，禁止切换分支' : '切换分支'"
+                >
+                  <span class="branch-name">{{ repoDetail.currentBranch }}</span>
+                  <span class="chev">▾</span>
+                </button>
+                <div v-if="branchUI[repoDetail.repoKey]?.open" class="branch-dropdown">
+                  <div class="branch-search">
+                    <input v-model="branchUI[repoDetail.repoKey].query" class="branch-search-input" type="text" placeholder="搜索分支..." />
+                  </div>
+                  <div class="branch-options">
+                    <button
+                      v-for="b in (branchUI[repoDetail.repoKey].branches || []).filter(x => !branchUI[repoDetail.repoKey].query || x.toLowerCase().includes(branchUI[repoDetail.repoKey].query.toLowerCase()))"
+                      :key="b"
+                      class="branch-option"
+                      @click="checkoutBranch(repoDetail.repoKey, repoDetail.repoPath, b)"
+                    >{{ b }}</button>
+                    <div v-if="branchUI[repoDetail.repoKey].loading" class="branch-loading">加载中...</div>
+                    <div v-else-if="(branchUI[repoDetail.repoKey].branches || []).length === 0" class="branch-empty">暂无分支</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="info-row">
+              <span class="info-label">📝 工作区</span>
+              <span class="status-badge" :class="repoDetail.workingTree?.clean ? 'clean' : 'dirty'">
+                {{ repoDetail.workingTree?.clean ? '✓ 干净' : repoDetail.workingTree?.summary }}
+              </span>
+            </div>
+
+            <div class="info-row">
+              <span class="info-label">⬆️ 当前分支同步</span>
+              <div class="sync-status">
+                <span v-if="repoDetail.currentStatus?.synced" class="sync-badge synced">✓ 已同步</span>
+                <template v-else>
+                  <span v-if="repoDetail.currentStatus?.behind > 0" class="sync-badge behind">↓ {{ repoDetail.currentStatus.behind }} 落后</span>
+                  <span v-if="repoDetail.currentStatus?.ahead > 0" class="sync-badge ahead">↑ {{ repoDetail.currentStatus.ahead }} 领先</span>
+                </template>
+                <button
+                  v-if="repoDetail.currentStatus?.behind > 0"
+                  class="pull-btn"
+                  :disabled="!repoDetail.workingTree?.clean || loadingRepos.has(repoDetail.repoKey)"
+                  @click="pullCurrentBranch(repoDetail.repoKey, repoDetail.repoPath)"
+                >Pull</button>
+              </div>
+            </div>
+
+            <div class="info-row">
+              <span class="info-label">🔄 latest 同步</span>
+              <div class="sync-status">
+                <span v-if="repoDetail.latestStatus?.synced" class="sync-badge synced">✓ 已同步</span>
+                <template v-else>
+                  <span v-if="repoDetail.latestStatus?.behind > 0" class="sync-badge behind">↓ {{ repoDetail.latestStatus.behind }} 落后</span>
+                  <span v-if="repoDetail.latestStatus?.ahead > 0" class="sync-badge ahead">↑ {{ repoDetail.latestStatus.ahead }} 领先</span>
+                </template>
+                <button class="merge-btn" :disabled="!repoDetail.workingTree?.clean" @click="openMergeModal(repoDetail.repoKey, repoDetail.repoPath, repoDetail.repoName)">Merge latest</button>
+              </div>
+            </div>
+
+            <div class="detail-subtitle">最近提交</div>
+            <div v-if="repoDetail.recentCommits.length === 0" class="muted">暂无提交记录</div>
+            <div v-else class="commit-list">
+              <div v-for="c in repoDetail.recentCommits" :key="c.hash" class="commit-item">
+                <span class="commit-hash">{{ (c.hash || '').slice(0, 7) }}</span>
+                <span class="commit-message">{{ c.message }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="detail-section">
+            <div v-if="!githubToken" class="empty-state small">
+              <div class="empty-icon">🔑</div>
+              <p>请先在设置中配置 GitHub Token</p>
+            </div>
+            <template v-else>
+              <div class="pr-controls">
+                <div class="pr-search">
+                  <input v-model="repoDetail.prSearch" class="pr-search-input" type="text" placeholder="搜索 PR（标题/分支/作者）..." />
+                </div>
+                <label class="pr-filter">
+                  <input v-model="repoDetail.prOnlyAssignedToMe" type="checkbox" />
+                  <span>只看指派给我（Review）</span>
+                </label>
+                <button class="action-btn" title="刷新 PR" @click="fetchRepoPRs" :disabled="repoDetail.prsLoading">🔄</button>
+              </div>
+
+              <div v-if="repoDetail.prsLoading" class="loading-state">
+                <div class="spinner"></div>
+                <span>加载 Pull Requests...</span>
+              </div>
+              <div v-else-if="repoDetail.prsError" class="error-state">
+                <span class="error-icon">⚠️</span>
+                <span>{{ repoDetail.prsError }}</span>
+              </div>
+              <div v-else class="pr-list pr-scroll">
+                <div v-if="filteredRepoPRs.length === 0" class="empty-state small">
+                  <div class="empty-icon">✨</div>
+                  <p>没有匹配的 Pull Requests</p>
+                </div>
+                <div
+                  v-for="pr in filteredRepoPRs"
+                  :key="pr.id"
+                  class="pr-card"
+                  :class="{ 'needs-review': pr.needsMyReview, 'is-author': pr.isAuthor, 'is-draft': pr.draft }"
+                  @click="openPR(pr.url)"
+                >
+                  <div class="pr-header">
+                    <div class="pr-title-row">
+                      <span class="pr-number">#{{ pr.number }}</span>
+                      <span class="pr-title">{{ pr.title }}</span>
+                    </div>
+                    <div class="pr-badges">
+                      <span v-if="pr.draft" class="badge draft">Draft</span>
+                      <span v-if="pr.needsMyReview" class="badge review-needed">需要 Review</span>
+                      <span v-if="pr.isAuthor" class="badge author">我的 PR</span>
+                    </div>
+                  </div>
+                  <div class="pr-info">
+                    <div class="branch-flow">
+                      <span class="branch base">{{ pr.base }}</span>
+                      <span class="arrow">←</span>
+                      <span class="branch head">{{ pr.head }}</span>
+                    </div>
+                    <div class="pr-meta">
+                      <div class="author-info">
+                        <img v-if="pr.authorAvatar" :src="pr.authorAvatar" :alt="pr.author" class="avatar" />
+                        <span class="author-name">{{ pr.author }}</span>
+                      </div>
+                      <span class="pr-time">{{ formatTime(pr.updatedAt) }}</span>
+                    </div>
+                  </div>
+                  <div v-if="pr.reviewers.length > 0" class="pr-reviewers">
+                    <span class="reviewers-label">Reviewers:</span>
+                    <div class="reviewer-list">
+                      <div v-for="reviewer in pr.reviewers" :key="reviewer.login" class="reviewer" :class="{ 'is-me': reviewer.login === currentGitHubUser }">
+                        <img v-if="reviewer.avatar" :src="reviewer.avatar" :alt="reviewer.login" class="avatar" />
+                        <span class="reviewer-name">{{ reviewer.login }}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+    
+    <!-- Merge Modal -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div v-if="showMergeModal" class="modal-overlay" @click.self="closeMergeModal">
+          <div class="modal-container merge-modal">
+            <div class="modal-header">
+              <h3>🔀 Merge Latest</h3>
+              <button class="close-btn" @click="closeMergeModal">✕</button>
+            </div>
+            
+            <div class="modal-content">
+              <div class="merge-info">
+                <div class="info-item">
+                  <span class="label">仓库</span>
+                  <span class="value">{{ mergeTarget.repoName }}</span>
+                </div>
+                <div class="info-item">
+                  <span class="label">源分支</span>
+                  <span class="value branch-tag">{{ mergeTarget.sourceBranch }}</span>
+                </div>
+              </div>
+              
+              <div class="form-section">
+                <label>目标分支</label>
+                <div class="merge-branch-picker">
+                  <button class="branch-select" type="button" @click="mergeTarget.open = !mergeTarget.open">
+                    <span>{{ mergeTarget.targetBranch || '选择目标分支...' }}</span>
+                    <span class="chev">▾</span>
+                  </button>
+                  <div v-if="mergeTarget.open" class="branch-dropdown">
+                    <div class="branch-search">
+                      <input
+                        v-model="mergeTarget.query"
+                        class="branch-search-input"
+                        type="text"
+                        placeholder="搜索目标分支..."
+                      />
+                    </div>
+                    <div class="branch-options">
+                      <button
+                        v-for="b in (mergeTarget.branches || []).filter(x => !mergeTarget.query || x.toLowerCase().includes(mergeTarget.query.toLowerCase()))"
+                        :key="b"
+                        class="branch-option"
+                        @click="mergeTarget.targetBranch = b; mergeTarget.open = false"
+                      >
+                        {{ b }}
+                      </button>
+                      <div v-if="(mergeTarget.branches || []).length === 0" class="branch-empty">暂无分支</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              
+              <!-- Merge 结果 -->
+              <div v-if="mergeResult" class="merge-result" :class="{ success: mergeResult.success, error: !mergeResult.success }">
+                <span class="result-icon">{{ mergeResult.success ? '✅' : '❌' }}</span>
+                <span class="result-message">{{ mergeResult.message }}</span>
+              </div>
+            </div>
+            
+            <div class="modal-footer">
+              <button class="btn-secondary" @click="closeMergeModal">取消</button>
+              <button 
+                class="btn-primary"
+                @click="executeMerge"
+                :disabled="!mergeTarget.targetBranch || merging"
+              >
+                <span v-if="merging" class="mini-spinner"></span>
+                {{ merging ? '合并中...' : '执行 Merge' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+  </div>
+</template>
+
+<style scoped>
+.git-module {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 20px;
+  padding-bottom: 100px;
+  overflow-y: auto;
+}
+
+/* ============================================
+   Header
+   ============================================ */
+.module-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.module-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.repo-details-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: transparent;
+}
+
+.details-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.back-btn {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.back-btn:hover {
+  background: var(--glass-bg-hover);
+  color: var(--text-primary);
+}
+
+.details-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.repo-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.details-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding: 14px;
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.pr-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 6px;
+  padding-bottom: 14px;
+}
+
+.view-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.view-tab:hover {
+  background: var(--glass-bg-hover);
+  color: var(--text-primary);
+}
+
+.view-tab.active {
+  background: var(--accent-primary-bg);
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.tab-icon {
+  font-size: 16px;
+}
+
+.tab-count {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--glass-bg-hover);
+  border-radius: 10px;
+}
+
+.tab-count.highlight {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+}
+
+.refresh-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 16px;
+  transition: all 0.2s;
+}
+
+.refresh-btn:hover:not(:disabled) {
+  background: var(--glass-bg-hover);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.detail-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.detail-tab {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.detail-tab:hover {
+  background: var(--glass-bg-hover);
+  color: var(--text-primary);
+}
+
+.detail-tab.active {
+  color: var(--broker-color, var(--accent-primary));
+  border-color: var(--broker-color, var(--accent-primary));
+  background: var(--broker-color-bg, var(--accent-primary-bg));
+}
+
+.detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 让 PR 列表区域可滚动到底：父容器必须允许子元素收缩 */
+.details-body .detail-section {
+  min-height: 0;
+}
+
+.detail-subtitle {
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.muted {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* ============================================
+   Repo Grid
+   ============================================ */
+.repo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 20px;
+}
+
+.init-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.init-loading-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  color: var(--text-secondary);
+}
+
+.init-loading-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--accent-primary);
+  box-shadow: 0 0 0 6px var(--accent-primary-bg);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.init-loading-text {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.skeleton-grid .repo-card {
+  border-left: 4px solid rgba(255, 255, 255, 0.12);
+}
+
+.repo-card.skeleton {
+  position: relative;
+  overflow: hidden;
+}
+
+.repo-card.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.06) 45%,
+    rgba(255, 255, 255, 0.12) 50%,
+    rgba(255, 255, 255, 0.06) 55%,
+    transparent 100%
+  );
+  transform: translateX(-100%);
+  animation: shimmer 1.4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.skeleton-line {
+  height: 12px;
+  border-radius: 8px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+}
+
+.skeleton-pill {
+  opacity: 0.7;
+}
+
+.skeleton-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+}
+
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.skeleton-row:last-of-type {
+  border-bottom: none;
+}
+
+.w-120 { width: 120px; }
+.w-140 { width: 140px; }
+.w-180 { width: 180px; }
+.w-200 { width: 200px; }
+
+.skeleton-btn {
+  width: 100%;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(120%); }
+}
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); opacity: 0.9; }
+  50% { transform: scale(1.08); opacity: 1; }
+}
+
+.repo-card {
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  overflow: hidden;
+  transition: all 0.3s;
+}
+
+.repo-card {
+  /* per-broker accent */
+  border-left: 4px solid var(--broker-color, var(--glass-border));
+}
+
+.repo-card:hover {
+  border-color: var(--accent-primary);
+  box-shadow: var(--shadow-glass);
+}
+
+.repo-card.has-changes {
+  border-color: #f59e0b;
+}
+
+.repo-card.error {
+  border-color: #ef4444;
+}
+
+.repo-card.is-tmgm {
+  border-left-width: 6px;
+  box-shadow: 0 0 0 1px var(--broker-color-bg) inset;
+}
+
+/* Card Header */
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.repo-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.broker-badge {
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--broker-color, var(--accent-primary));
+  background: var(--broker-color-bg, var(--accent-primary-bg));
+  border: 1px solid var(--broker-color, var(--accent-primary));
+  border-radius: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.repo-card.is-tmgm .broker-badge {
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 800;
+  box-shadow: 0 0 0 1px var(--broker-color-bg) inset, 0 10px 24px var(--broker-color-glow);
+}
+
+.repo-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.action-btn {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+}
+
+.action-btn:hover:not(:disabled) {
+  background: var(--glass-bg-hover);
+}
+
+/* Card Content */
+.card-content {
+  padding: 16px 20px;
+}
+
+.card-loading,
+.card-error {
+  padding: 32px 20px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.card-error {
+  color: #ef4444;
+}
+
+.error-icon {
+  margin-right: 8px;
+}
+
+.info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.info-row:last-of-type {
+  border-bottom: none;
+}
+
+.info-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.pr-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mini-muted {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.pr-chip {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.pr-chip.mine {
+  color: var(--broker-color, var(--accent-primary));
+  background: var(--broker-color-bg, var(--accent-primary-bg));
+  border-color: var(--broker-color, var(--accent-primary));
+}
+
+.pr-chip.review {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.branch-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-primary);
+  font-family: var(--font-mono);
+}
+
+.branch-switch {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.branch-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.branch-pill:hover:not(:disabled) {
+  background: var(--glass-bg-hover);
+  border-color: var(--accent-primary);
+}
+
+.branch-pill:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.chev {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.branch-dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: 320px;
+  background: var(--modal-bg);
+  border: 1px solid var(--modal-border);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25);
+  z-index: 50;
+}
+
+.branch-search {
+  padding: 10px;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.branch-search-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  outline: none;
+}
+
+.branch-search-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.branch-options {
+  max-height: 240px;
+  overflow: auto;
+}
+
+.branch-option {
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.branch-option:hover {
+  background: var(--glass-bg-hover);
+}
+
+.branch-loading,
+.branch-empty {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.pull-btn {
+  margin-left: 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-primary);
+  background: var(--accent-primary-bg);
+  border: 1px solid var(--accent-primary);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.pull-btn:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+
+.pull-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.status-badge {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 6px;
+}
+
+.status-badge.clean {
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.15);
+}
+
+.status-badge.dirty {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.15);
+}
+
+.sync-status {
+  display: flex;
+  gap: 8px;
+}
+
+.sync-badge {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 6px;
+}
+
+.sync-badge.synced {
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.15);
+}
+
+.sync-badge.behind {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.sync-badge.ahead {
+  color: #3b82f6;
+  background: rgba(59, 130, 246, 0.15);
+}
+
+/* Recent Commits */
+.recent-commits {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.commits-header {
+  margin-bottom: 8px;
+}
+
+.commit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.commit-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+}
+
+.commit-hash {
+  font-family: var(--font-mono);
+  color: var(--accent-primary);
+  background: var(--accent-primary-bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.commit-message {
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+/* Card Footer */
+.card-footer {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.merge-btn {
+  width: 100%;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.merge-btn:hover:not(:disabled) {
+  background: var(--accent-primary-bg);
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.merge-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ============================================
+   PR List
+   ============================================ */
+.pr-stats {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 24px;
+  padding: 16px 20px;
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+}
+
+.pr-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.pr-search {
+  flex: 1;
+}
+
+.pr-search-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  outline: none;
+}
+
+.pr-search-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.pr-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.pr-filter input {
+  accent-color: var(--accent-primary);
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.stat-item.highlight .stat-value {
+  color: #ef4444;
+}
+
+.stat-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.pr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pr-card {
+  padding: 16px 20px;
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.pr-card:hover {
+  border-color: var(--accent-primary);
+  background: var(--glass-bg-hover);
+}
+
+.pr-card.needs-review {
+  border-left: 3px solid #ef4444;
+}
+
+.pr-card.is-author {
+  border-left: 3px solid #3b82f6;
+}
+
+.pr-card.is-draft {
+  opacity: 0.7;
+}
+
+.pr-header {
+  margin-bottom: 12px;
+}
+
+.pr-title-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.pr-number {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-primary);
+  font-family: var(--font-mono);
+}
+
+.pr-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.pr-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.badge {
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.badge.draft {
+  color: #6b7280;
+  background: rgba(107, 114, 128, 0.15);
+}
+
+.badge.review-needed {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.badge.author {
+  color: #3b82f6;
+  background: rgba(59, 130, 246, 0.15);
+}
+
+.badge.repo {
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+}
+
+.pr-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.branch-flow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.branch {
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--glass-bg);
+}
+
+.branch.base {
+  color: #10b981;
+}
+
+.branch.head {
+  color: var(--accent-primary);
+}
+
+.arrow {
+  color: var(--text-tertiary);
+}
+
+.pr-meta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.author-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+}
+
+.author-name {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.pr-time {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.pr-reviewers {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.reviewers-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.reviewer-list {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.reviewer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--glass-bg);
+  border-radius: 16px;
+  font-size: 11px;
+}
+
+.reviewer.is-me {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+
+.reviewer .avatar {
+  width: 18px;
+  height: 18px;
+}
+
+.reviewer-name {
+  color: var(--text-secondary);
+}
+
+.reviewer.is-me .reviewer-name {
+  color: #ef4444;
+  font-weight: 600;
+}
+
+/* ============================================
+   Empty & Loading States
+   ============================================ */
+.empty-state,
+.loading-state,
+.error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+}
+
+.empty-state.small {
+  padding: 40px 20px;
+}
+
+.empty-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.empty-state h3 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 8px 0;
+}
+
+.empty-state p {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid var(--glass-border);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin-bottom: 12px;
+}
+
+.mini-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--glass-border);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinning {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}
+
+/* ============================================
+   Modal
+   ============================================ */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--overlay-bg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-container {
+  width: 90%;
+  max-width: 480px;
+  background: var(--modal-bg);
+  border: 1px solid var(--modal-border);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.modal-header h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.close-btn {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.2s;
+}
+
+.close-btn:hover {
+  background: var(--glass-bg-hover);
+  color: var(--text-primary);
+}
+
+.modal-content {
+  padding: 24px;
+}
+
+.merge-info {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 16px;
+  background: var(--glass-bg);
+  border-radius: 10px;
+}
+
+.info-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.info-item .label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.info-item .value {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.branch-tag {
+  padding: 4px 10px;
+  background: var(--accent-primary-bg);
+  color: var(--accent-primary);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+}
+
+.form-section {
+  margin-bottom: 20px;
+}
+
+.form-section label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.branch-select {
+  width: 100%;
+  padding: 12px 16px;
+  font-size: 14px;
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.branch-select:focus {
+  border-color: var(--accent-primary);
+}
+
+.merge-branch-picker {
+  position: relative;
+}
+
+.merge-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.merge-result.success {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+}
+
+.merge-result.error {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 20px 24px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.btn-secondary,
+.btn-primary {
+  padding: 10px 20px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-secondary {
+  color: var(--text-secondary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+}
+
+.btn-secondary:hover {
+  background: var(--glass-bg-hover);
+  color: var(--text-primary);
+}
+
+.btn-primary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: white;
+  background: var(--accent-primary);
+  border: none;
+}
+
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Modal Transitions */
+.modal-enter-active,
+.modal-leave-active {
+  transition: opacity 0.2s ease;
+}
+
+.modal-enter-active .modal-container,
+.modal-leave-active .modal-container {
+  transition: transform 0.2s ease;
+}
+
+.modal-enter-from,
+.modal-leave-to {
+  opacity: 0;
+}
+
+.modal-enter-from .modal-container,
+.modal-leave-to .modal-container {
+  transform: scale(0.95);
+}
+</style>

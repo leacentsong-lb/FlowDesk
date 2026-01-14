@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+src-tauri/target/
+
+# local tooling
+.cursor/
+.claude/
+.shared/
+
+# OS
+.DS_Store
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
