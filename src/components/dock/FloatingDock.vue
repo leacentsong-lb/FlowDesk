@@ -53,20 +53,6 @@ const handleSpotlight = () => {
           <span class="dock-label">设置</span>
         </button>
       </div>
-      
-      <!-- Divider -->
-      <div class="dock-divider"></div>
-      
-      <!-- Spotlight Search -->
-      <button
-        class="dock-spotlight"
-        title="快速搜索 (⌘K)"
-        @click="handleSpotlight"
-      >
-        <span class="spotlight-icon">🔍</span>
-        <span class="spotlight-text">搜索...</span>
-        <span class="spotlight-shortcut">⌘K</span>
-      </button>
     </div>
   </div>
 </template>

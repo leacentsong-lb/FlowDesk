@@ -3,10 +3,10 @@ import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 
 // Tab 状态
-const activeTab = ref('github')
+const activeTab = ref('ai')
 const tabs = [
-  { id: 'github', label: 'GitHub', icon: '🐙' },
-  { id: 'ai', label: 'AI资讯', icon: '🤖' }
+  { id: 'ai', label: 'AI资讯', icon: '🤖' },
+  { id: 'github', label: 'GitHub', icon: '🐙' }
 ]
 
 // 加载状态
@@ -18,7 +18,8 @@ const trendingRepos = ref([])
 const selectedPeriod = ref('daily')
 const periods = [
   { id: 'daily', label: 'Today' },
-  { id: 'weekly', label: 'This Week' }
+  { id: 'weekly', label: 'This week' },
+  { id: 'monthly', label: 'This month' }
 ]
 
 // AI 资讯数据
@@ -28,52 +29,76 @@ const aiCurrentPage = ref(1)
 const aiPageSize = 15
 const aiHasMore = computed(() => aiCurrentPage.value * aiPageSize < allAiNews.value.length)
 
-// 中文 AI 资讯来源 (使用 RSSHub)
+// 中文/技术向 AI 资讯来源（优先直连 RSS，避免 RSSHub 不稳定/被限流；必要时再 fallback RSSHub）
+// 每个来源可以配置多个候选 URL，按顺序尝试，成功一个就用。
 const aiSources = [
-  { 
-    name: '机器之心',
-    rsshubPath: '/jiqizhixin',
-    icon: '🤖',
-    color: '#6366f1'
-  },
-  { 
-    name: '量子位',
-    rsshubPath: '/qbitai',
-    icon: '⚛️',
-    color: '#06b6d4'
+  {
+    name: 'InfoQ',
+    icon: '📡',
+    color: '#10b981',
+    urls: [
+      // InfoQ 中文（较稳定）
+      'https://www.infoq.cn/feed',
+      // InfoQ 英文 articles（兜底）
+      'https://www.infoq.com/RSS/articles/'
+    ],
+    // 只保留 AI 相关条目（避免全站内容太杂）
+    keywords: ['ai', '人工智能', '大模型', 'llm', 'agent', '模型', 'deepseek', 'gpt', 'claude']
   },
   {
-    name: '36氪 AI',
-    rsshubPath: '/36kr/newsflashes',
+    name: '36氪',
     icon: '🔷',
-    color: '#3b82f6'
+    color: '#3b82f6',
+    urls: [
+      'https://www.36kr.com/feed'
+    ],
+    keywords: ['ai', '人工智能', '大模型', 'llm', 'agent', '模型', 'deepseek', 'gpt', 'claude']
+  },
+  {
+    name: '机器之心',
+    icon: '🤖',
+    color: '#6366f1',
+    urls: [
+      // 有些站点会暴露 /rss 或 /feed，尝试常见路径
+      'https://www.jiqizhixin.com/rss',
+      'https://www.jiqizhixin.com/feed',
+      // fallback：RSSHub（如可用）
+      'https://rsshub.app/jiqizhixin'
+    ],
+    keywords: ['ai', '人工智能', '大模型', 'llm', 'agent', '模型', '深度学习', '推理', '多模态']
+  },
+  {
+    name: '量子位',
+    icon: '⚛️',
+    color: '#06b6d4',
+    urls: [
+      // RSSHub 分类路由（更可能可用）
+      'https://rsshub.app/qbitai/category/资讯',
+      // 常见直连尝试（若网站提供）
+      'https://www.qbitai.com/feed',
+      'https://www.qbitai.com/rss'
+    ],
+    keywords: ['ai', '人工智能', '大模型', 'llm', 'agent', '模型', 'deepseek', 'gpt', 'claude']
   }
 ]
 
-// RSSHub 实例列表 (按可用性排序)
-const rsshubInstances = [
-  'https://rsshub.app',
-  'https://rsshub.rssforever.com',
-  'https://hub.slarker.me'
-]
-
-// 获取 GitHub Trending
+/**
+ * 获取 GitHub Trending
+ */
 const fetchGitHubTrending = async () => {
   loading.value.github = true
   error.value.github = ''
   
   try {
-    // 使用 GitHub 非官方 API (无需认证)
-    const response = await fetch(
-      `https://api.gitterapp.com/repositories?since=${selectedPeriod.value}&language=&spoken_language_code=`
-    )
-    
-    if (response.ok) {
-      const data = await response.json()
-      trendingRepos.value = (data || []).slice(0, 10).map(repo => ({
+    const url = `https://api.gitterapp.com/repositories?since=${selectedPeriod.value}&language=&spoken_language_code=`
+    const result = await invoke('fetch_rss_feed', { url })
+
+    if (result.status === 200) {
+      const data = JSON.parse(result.body || '[]')
+      trendingRepos.value = (data || []).slice(0, 15).map(repo => ({
         name: `${repo.author}/${repo.name}`,
         description: repo.description || '',
-        language: repo.language || 'Unknown',
+        language: repo.language || '',
         languageColor: repo.languageColor || '#8b949e',
         stars: repo.stars || 0,
         starsToday: repo.currentPeriodStars || 0,
@@ -81,12 +106,10 @@ const fetchGitHubTrending = async () => {
         url: repo.url || `https://github.com/${repo.author}/${repo.name}`
       }))
     } else {
-      // 备用：使用静态数据
       trendingRepos.value = getStaticTrendingData()
     }
   } catch (e) {
     console.error('GitHub trending fetch error:', e)
-    // 使用静态数据作为备用
     trendingRepos.value = getStaticTrendingData()
   } finally {
     loading.value.github = false
@@ -102,35 +125,43 @@ const getStaticTrendingData = () => [
   { name: 'microsoft/vscode', description: 'Visual Studio Code', language: 'TypeScript', languageColor: '#3178c6', stars: 162000, starsToday: 78, forks: 28500 }
 ]
 
-// 尝试从 RSSHub 实例获取 RSS
-const fetchFromRSSHub = async (path) => {
-  for (const instance of rsshubInstances) {
+// 尝试从多个候选 URL 获取 RSS/XML（通过 Rust 侧 fetch，避免 CORS）
+const fetchFromCandidates = async (urls) => {
+  for (const url of (urls || [])) {
     try {
-      const url = `${instance}${path}`
       const result = await invoke('fetch_rss_feed', { url })
-      if (result.status === 200 && result.body) {
-        return result.body
-      }
+      if (result.status === 200 && result.body) return result.body
     } catch (e) {
-      console.warn(`RSSHub instance ${instance} failed:`, e)
+      // ignore and try next
     }
   }
   return null
 }
 
-// 解析 RSS XML
+// 解析 RSS/Atom XML
 const parseRSSItems = (xmlString, sourceName, sourceIcon, sourceColor) => {
   const items = []
   try {
     const parser = new DOMParser()
     const xml = parser.parseFromString(xmlString, 'text/xml')
-    const rssItems = xml.querySelectorAll('item')
+    // RSS 2.0 uses <item>, Atom uses <entry>
+    const nodes = xml.querySelectorAll('item, entry')
     
-    rssItems.forEach((item) => {
-      const title = item.querySelector('title')?.textContent?.trim() || ''
-      const link = item.querySelector('link')?.textContent?.trim() || ''
-      const description = item.querySelector('description')?.textContent?.trim() || ''
-      const pubDate = item.querySelector('pubDate')?.textContent || ''
+    nodes.forEach((node) => {
+      const title = node.querySelector('title')?.textContent?.trim() || ''
+      // Atom: <link href="..."/> ; RSS: <link>...</link>
+      const linkEl = node.querySelector('link')
+      const link = (linkEl?.getAttribute?.('href') || linkEl?.textContent || '').trim()
+      const description =
+        node.querySelector('description')?.textContent?.trim() ||
+        node.querySelector('summary')?.textContent?.trim() ||
+        node.querySelector('content')?.textContent?.trim() ||
+        ''
+      const pubDate =
+        node.querySelector('pubDate')?.textContent ||
+        node.querySelector('updated')?.textContent ||
+        node.querySelector('published')?.textContent ||
+        ''
       
       // 清理 HTML 标签
       const cleanDesc = description
@@ -144,7 +175,7 @@ const parseRSSItems = (xmlString, sourceName, sourceIcon, sourceColor) => {
       
       if (title) {
         items.push({
-          id: `${sourceName}-${Date.now()}-${Math.random()}`,
+          id: `${sourceName}-${link || title}-${pubDate || ''}`.slice(0, 200),
           title,
           description: cleanDesc,
           link,
@@ -170,13 +201,26 @@ const fetchAINews = async () => {
   aiCurrentPage.value = 1
   
   try {
-    // 并行获取所有来源
+    const PER_SOURCE_LIMIT = 12
+
+    // 并行获取所有来源（每个源独立容错）
     const fetchPromises = aiSources.map(async (source) => {
-      const xmlContent = await fetchFromRSSHub(source.rsshubPath)
-      if (xmlContent) {
-        return parseRSSItems(xmlContent, source.name, source.icon, source.color)
+      const xmlContent = await fetchFromCandidates(source.urls)
+      if (!xmlContent) return []
+
+      let items = parseRSSItems(xmlContent, source.name, source.icon, source.color)
+
+      // 可选：按关键词过滤（避免全站内容太杂）
+      const kws = (source.keywords || []).map(k => k.toLowerCase())
+      if (kws.length > 0) {
+        items = items.filter(it => {
+          const hay = `${it.title} ${it.description}`.toLowerCase()
+          return kws.some(k => hay.includes(k))
+        })
       }
-      return []
+
+      // 每个来源最多取 N 条，保证混合效果
+      return items.slice(0, PER_SOURCE_LIMIT)
     })
     
     const results = await Promise.all(fetchPromises)
@@ -289,8 +333,8 @@ const refresh = () => {
 }
 
 onMounted(() => {
-  fetchGitHubTrending()
   fetchAINews()
+  setTimeout(() => fetchGitHubTrending(), 0)
 })
 </script>
 
@@ -321,18 +365,10 @@ onMounted(() => {
         </button>
       </div>
       
-      <!-- GitHub Trending -->
+      <!-- GitHub 智能混合 Feed -->
       <template v-if="activeTab === 'github'">
-        <div class="period-tabs">
-          <button
-            v-for="p in periods"
-            :key="p.id"
-            class="period-btn"
-            :class="{ active: selectedPeriod === p.id }"
-            @click="selectedPeriod = p.id; fetchGitHubTrending()"
-          >
-            {{ p.label }}
-          </button>
+        <div class="feed-hint">
+          <span class="hint-text">🎯 智能推荐：热门趋势 + 新兴之星 + 话题精选</span>
         </div>
         
         <div v-if="loading.github" class="loading-state">
@@ -342,12 +378,21 @@ onMounted(() => {
         
         <div v-else class="repo-list">
           <div
-            v-for="(repo, index) in trendingRepos"
+            v-for="repo in mixedFeed"
             :key="repo.name"
             class="repo-card"
             @click="openLink(repo.url)"
           >
-            <div class="repo-rank">{{ index + 1 }}</div>
+            <div class="repo-tag-wrapper">
+              <span 
+                class="repo-tag" 
+                :class="repo.tag"
+                :style="{ background: TAG_TYPES[repo.tag]?.color + '20', color: TAG_TYPES[repo.tag]?.color }"
+              >
+                {{ TAG_TYPES[repo.tag]?.icon }} {{ TAG_TYPES[repo.tag]?.label }}
+                <span v-if="repo.tag === 'topic' && repo.topicLang" class="tag-lang">· {{ repo.topicLang }}</span>
+              </span>
+            </div>
             <div class="repo-content">
               <div class="repo-name">{{ repo.name }}</div>
               <div class="repo-desc">{{ repo.description }}</div>
@@ -357,7 +402,7 @@ onMounted(() => {
                   {{ repo.language }}
                 </span>
                 <span class="repo-stars">⭐ {{ formatStars(repo.stars) }}</span>
-                <span class="repo-stars-today">+{{ repo.starsToday }} today</span>
+                <span class="repo-stars-today">+{{ repo.starsToday }}</span>
               </div>
             </div>
           </div>
@@ -403,7 +448,7 @@ onMounted(() => {
     
     <div class="panel-footer">
       <span class="footer-text">
-        {{ activeTab === 'github' ? 'GitHub Trending' : `AI 热门资讯 (${aiNews.length}/${allAiNews.length})` }}
+        {{ activeTab === 'github' ? `GitHub 发现 (${mixedFeed.length})` : `AI 热门资讯 (${aiNews.length}/${allAiNews.length})` }}
       </span>
       <span class="update-time">刚刚更新</span>
     </div>
@@ -524,34 +569,57 @@ onMounted(() => {
   font-size: 14px;
 }
 
-/* Period Tabs */
-.period-tabs {
+/* Feed Hint */
+.feed-hint {
   display: flex;
-  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
   margin-bottom: 14px;
-}
-
-.period-btn {
-  padding: 6px 14px;
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--text-tertiary);
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.2s;
+  border-radius: 8px;
 }
 
-.period-btn:hover {
-  background: var(--glass-bg-hover);
-  color: var(--text-secondary);
+.hint-text {
+  font-size: 11px;
+  color: var(--text-tertiary);
 }
 
-.period-btn.active {
-  background: var(--accent-secondary-glow);
-  border-color: var(--accent-secondary);
-  color: var(--accent-secondary-light);
+/* Repo Tag */
+.repo-tag-wrapper {
+  margin-bottom: 8px;
+}
+
+.repo-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 4px;
+}
+
+.repo-tag.trending {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+}
+
+.repo-tag.rising {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10b981;
+}
+
+.repo-tag.topic {
+  background: rgba(99, 102, 241, 0.15);
+  color: #6366f1;
+}
+
+.tag-lang {
+  font-weight: 400;
+  opacity: 0.8;
+  text-transform: capitalize;
 }
 
 /* Loading */
@@ -584,7 +652,7 @@ onMounted(() => {
 
 .repo-card {
   display: flex;
-  gap: 12px;
+  flex-direction: column;
   padding: 12px;
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
@@ -596,20 +664,6 @@ onMounted(() => {
 .repo-card:hover {
   background: var(--glass-bg-hover);
   border-color: var(--accent-secondary);
-}
-
-.repo-rank {
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-tertiary);
-  background: var(--glass-bg);
-  border-radius: 6px;
-  flex-shrink: 0;
 }
 
 .repo-content {

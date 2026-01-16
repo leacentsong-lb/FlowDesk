@@ -1,6 +1,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { AIChatService, AIConfigManager } from '../../services/ai-service'
 
 // ============================================
 // 状态定义
@@ -19,6 +20,11 @@ const loadingRepos = ref(new Set())
 const repoErrors = ref({})
 // 列表页 PR 摘要（轻量，仅与你相关）
 const prSummary = reactive({}) // key -> { loading, mine, review }
+
+// 聚合所有仓库的"关于我的 PR"（用于顶部汇总展示）
+const allMyPRs = ref([])
+const allMyPRsLoading = ref(false)
+const allMyPRsLoaded = ref(false)
 
 // Repo 详情页（按需加载：分支/同步/提交/PR）
 const showRepoDetailsPage = ref(false)
@@ -62,6 +68,12 @@ const mergeTarget = ref({
 })
 const merging = ref(false)
 const mergeResult = ref(null)
+
+// AI Code Review 状态
+const showCodeReview = ref(false)
+const codeReviewLoading = ref(false)
+const codeReviewResult = ref('')
+const codeReviewError = ref('')
 
 const initReposLoading = ref(false)
 
@@ -193,44 +205,144 @@ const fetchRepoStatus = async (key, path) => {
 const fetchRepoPRSummary = async (key, path) => {
   if (!githubToken.value) return
   if (prSummary[key]?.loading) return
-  prSummary[key] = { loading: true, mine: 0, review: 0 }
+  // 简单缓存：60s 内不重复请求，避免频繁刷新打爆 GitHub API
+  const lastAt = prSummary[key]?.loadedAt ? new Date(prSummary[key].loadedAt).getTime() : 0
+  if (lastAt && Date.now() - lastAt < 60_000) return
+
+  prSummary[key] = { loading: true, mine: 0, review: 0, loadedAt: prSummary[key]?.loadedAt || null }
   try {
+    // currentGitHubUser 可能尚未拿到，先尽力获取一次（不阻塞失败）
+    if (!currentGitHubUser.value) {
+      await fetchCurrentUser().catch(() => {})
+    }
+
     const repoInfo = await invoke('git_get_remote_info', { projectPath: path }).catch(() => '')
     const normalized = (repoInfo || '').trim().replace(/\.git$/i, '')
     const [owner, repo] = normalized.split('/').filter(Boolean)
     if (!owner || !repo) {
-      prSummary[key] = { loading: false, mine: 0, review: 0 }
+      prSummary[key] = { loading: false, mine: 0, review: 0, loadedAt: new Date().toISOString() }
       return
     }
     const result = await invoke('github_list_open_prs', { owner, repo, token: githubToken.value })
     if (result.status !== 200) {
-      prSummary[key] = { loading: false, mine: 0, review: 0 }
+      prSummary[key] = { loading: false, mine: 0, review: 0, loadedAt: new Date().toISOString() }
       return
     }
     const prs = JSON.parse(result.body || '[]') || []
     const me = normalize(currentGitHubUser.value)
     const mine = prs.filter(pr => normalize(pr.user?.login) === me).length
     const review = prs.filter(pr => (pr.requested_reviewers || []).some(r => normalize(r.login) === me)).length
-    prSummary[key] = { loading: false, mine, review }
+    prSummary[key] = { loading: false, mine, review, loadedAt: new Date().toISOString() }
   } catch {
-    prSummary[key] = { loading: false, mine: 0, review: 0 }
+    prSummary[key] = { loading: false, mine: 0, review: 0, loadedAt: new Date().toISOString() }
   }
 }
 
 const schedulePRSummaryPrefetch = () => {
   if (!githubToken.value) return
-  // 避免同时打多个请求：逐个串行
-  let i = 0
+  // 并发预取（有限并发，避免 GitHub API rate limit）
+  const CONCURRENCY = 4
   const list = brokerList.value.slice(0)
-  const tick = async () => {
-    const item = list[i]
-    if (!item) return
-    const [key, path] = item
-    await fetchRepoPRSummary(key, path)
-    i++
-    setTimeout(tick, 150)
+  let idx = 0
+
+  const worker = async () => {
+    while (idx < list.length) {
+      const cur = list[idx++]
+      if (!cur) return
+      const [key, path] = cur
+      // 单仓库失败不影响整体
+      await fetchRepoPRSummary(key, path).catch(() => {})
+    }
   }
-  setTimeout(tick, 300)
+
+  // 让 UI 先渲染，再并发请求
+  setTimeout(() => {
+    const workers = Array.from({ length: Math.min(CONCURRENCY, list.length) }, () => worker())
+    Promise.all(workers).catch(() => {})
+  }, 150)
+  
+  // 同时预取聚合 PR 列表
+  setTimeout(() => fetchAllMyPRs(), 200)
+}
+
+// 获取所有仓库的"关于我的 PR"聚合列表
+const fetchAllMyPRs = async () => {
+  if (!githubToken.value) return
+  if (allMyPRsLoading.value) return
+  
+  allMyPRsLoading.value = true
+  const aggregated = []
+  
+  try {
+    // 确保拿到当前用户
+    if (!currentGitHubUser.value) {
+      await fetchCurrentUser().catch(() => {})
+    }
+    const me = normalize(currentGitHubUser.value)
+    
+    // 并发获取各仓库 PR
+    const results = await Promise.all(
+      brokerList.value.map(async ([key, path]) => {
+        try {
+          const repoInfo = await invoke('git_get_remote_info', { projectPath: path }).catch(() => '')
+          const normalized = (repoInfo || '').trim().replace(/\.git$/i, '')
+          const [owner, repo] = normalized.split('/').filter(Boolean)
+          if (!owner || !repo) return []
+          
+          const result = await invoke('github_list_open_prs', { owner, repo, token: githubToken.value })
+          if (result.status !== 200) return []
+          
+          const prs = JSON.parse(result.body || '[]') || []
+          // 筛选与我相关的 PR：我创建的 或 我是 reviewer
+          return prs
+            .filter(pr => {
+              const isMine = normalize(pr.user?.login) === me
+              const isReviewer = (pr.requested_reviewers || []).some(r => normalize(r.login) === me)
+              return isMine || isReviewer
+            })
+            .map(pr => ({
+              id: pr.id,
+              number: pr.number,
+              title: pr.title,
+              url: pr.html_url,
+              author: pr.user?.login,
+              authorAvatar: pr.user?.avatar_url,
+              base: pr.base?.ref,
+              head: pr.head?.ref,
+              draft: pr.draft,
+              createdAt: pr.created_at,
+              updatedAt: pr.updated_at,
+              repoKey: key,
+              repoName: repo,
+              isMine: normalize(pr.user?.login) === me,
+              isReviewer: (pr.requested_reviewers || []).some(r => normalize(r.login) === me)
+            }))
+        } catch {
+          return []
+        }
+      })
+    )
+    
+    // 扁平化并按更新时间排序
+    results.forEach(list => aggregated.push(...list))
+    aggregated.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+    
+    allMyPRs.value = aggregated
+    allMyPRsLoaded.value = true
+  } catch {
+    // 静默失败
+  } finally {
+    allMyPRsLoading.value = false
+  }
+}
+
+// 打开 PR 链接
+const openPRUrl = async (url) => {
+  try {
+    await invoke('open_url_raw', { url })
+  } catch {
+    window.open(url, '_blank')
+  }
 }
 // 切换分支（安全校验通过才允许）
 const checkoutBranch = async (key, path, branch) => {
@@ -458,6 +570,56 @@ const closeMergeModal = () => {
 }
 
 // ============================================
+// AI Code Review
+// ============================================
+
+// 执行 AI Code Review
+const performCodeReview = async () => {
+  if (!repoDetail.repoPath) return
+  
+  // 检查 AI 配置
+  if (!AIConfigManager.isConfigured()) {
+    codeReviewError.value = '请先在设置中配置 AI API Key'
+    showCodeReview.value = true
+    return
+  }
+  
+  codeReviewLoading.value = true
+  codeReviewResult.value = ''
+  codeReviewError.value = ''
+  showCodeReview.value = true
+  
+  try {
+    // 获取 git diff
+    const diffResult = await invoke('git_get_diff', {
+      repoPath: repoDetail.repoPath
+    })
+    
+    const diff = diffResult.body || ''
+    
+    if (!diff.trim()) {
+      codeReviewResult.value = '当前没有需要审查的代码变更。'
+      return
+    }
+    
+    // 调用 AI 进行代码审查
+    const review = await AIChatService.codeReview(diff, 'javascript')
+    codeReviewResult.value = review
+  } catch (e) {
+    codeReviewError.value = e.message || String(e)
+  } finally {
+    codeReviewLoading.value = false
+  }
+}
+
+// 关闭 Code Review
+const closeCodeReview = () => {
+  showCodeReview.value = false
+  codeReviewResult.value = ''
+  codeReviewError.value = ''
+}
+
+// ============================================
 // PR 相关方法
 // ============================================
 
@@ -625,7 +787,14 @@ onUnmounted(() => {
     <!-- 顶部导航 -->
     <div class="module-header">
       <div class="module-title">
-        <span class="tab-icon">🔀</span>
+        <span class="tab-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="6" y1="3" x2="6" y2="15"></line>
+            <circle cx="18" cy="6" r="3"></circle>
+            <circle cx="6" cy="18" r="3"></circle>
+            <path d="M18 9a9 9 0 0 1-9 9"></path>
+          </svg>
+        </span>
         <span>Git 仓库</span>
         <span class="tab-count" v-if="brokerList.length">{{ brokerList.length }}</span>
       </div>
@@ -636,7 +805,14 @@ onUnmounted(() => {
           @click="refreshAllRepos()"
           :disabled="loadingRepos.size > 0 || initReposLoading"
         >
-          <span :class="{ spinning: loadingRepos.size > 0 || initReposLoading }">🔄</span>
+          <span class="refresh-icon" :class="{ spinning: loadingRepos.size > 0 || initReposLoading }">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+              <path d="M3 3v5h5"></path>
+              <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path>
+              <path d="M16 21h5v-5"></path>
+            </svg>
+          </span>
         </button>
       </div>
     </div>
@@ -686,8 +862,63 @@ onUnmounted(() => {
         </div>
       </div>
       
-      <!-- 仓库卡片网格 -->
-      <div v-else class="repo-grid">
+      <!-- 正常内容区（PR 汇总 + 仓库卡片） -->
+      <template v-else>
+        <!-- 关于我的 PR 汇总（置顶） -->
+        <div v-if="allMyPRs.length > 0 || allMyPRsLoading" class="my-prs-section">
+          <div class="section-header">
+            <span class="section-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="18" cy="18" r="3"></circle>
+                <circle cx="6" cy="6" r="3"></circle>
+                <path d="M13 6h3a2 2 0 0 1 2 2v7"></path>
+                <line x1="6" y1="9" x2="6" y2="21"></line>
+              </svg>
+            </span>
+            <span class="section-title">关于我的 PR</span>
+            <span class="section-count" v-if="allMyPRs.length">{{ allMyPRs.length }}</span>
+            <button class="refresh-mini" @click="fetchAllMyPRs()" :disabled="allMyPRsLoading" title="刷新">
+              <span class="refresh-icon" :class="{ spinning: allMyPRsLoading }">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+                  <path d="M3 3v5h5"></path>
+                  <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path>
+                  <path d="M16 21h5v-5"></path>
+                </svg>
+              </span>
+            </button>
+          </div>
+          
+          <div v-if="allMyPRsLoading && allMyPRs.length === 0" class="pr-loading">
+            <div class="mini-spinner"></div>
+            <span>加载中...</span>
+          </div>
+          
+          <div v-else class="my-prs-list">
+            <div 
+              v-for="pr in allMyPRs" 
+              :key="pr.id" 
+              class="my-pr-item"
+              :class="{ draft: pr.draft, mine: pr.isMine, reviewer: pr.isReviewer && !pr.isMine }"
+              @click="openPRUrl(pr.url)"
+            >
+              <div class="pr-main">
+                <span class="pr-repo-badge" :style="brokerStyle(pr.repoKey)">{{ pr.repoKey.toUpperCase() }}</span>
+                <span class="pr-number">#{{ pr.number }}</span>
+                <span class="pr-title">{{ pr.title }}</span>
+              </div>
+              <div class="pr-meta">
+                <span class="pr-branch">{{ pr.head }} → {{ pr.base }}</span>
+                <span v-if="pr.isMine" class="pr-tag mine">我创建</span>
+                <span v-if="pr.isReviewer" class="pr-tag review">待我 Review</span>
+                <span v-if="pr.draft" class="pr-tag draft">Draft</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 仓库卡片网格 -->
+        <div class="repo-grid">
         <div 
           v-for="[key, path] in brokerList" 
           :key="key"
@@ -772,7 +1003,8 @@ onUnmounted(() => {
             </div>
           </div>
         </div>
-      </div>
+        </div>
+      </template>
     </div>
     
     <!-- 仓库详情页（点击仓库后再加载重信息 & PR） -->
@@ -837,6 +1069,15 @@ onUnmounted(() => {
               <span class="status-badge" :class="repoDetail.workingTree?.clean ? 'clean' : 'dirty'">
                 {{ repoDetail.workingTree?.clean ? '✓ 干净' : repoDetail.workingTree?.summary }}
               </span>
+              <button 
+                v-if="!repoDetail.workingTree?.clean"
+                class="ai-review-btn"
+                @click="performCodeReview"
+                :disabled="codeReviewLoading"
+                title="AI 代码审查"
+              >
+                {{ codeReviewLoading ? '⏳ 审查中...' : '🔍 AI Review' }}
+              </button>
             </div>
 
             <div class="info-row">
@@ -892,7 +1133,16 @@ onUnmounted(() => {
                   <input v-model="repoDetail.prOnlyAssignedToMe" type="checkbox" />
                   <span>只看指派给我（Review）</span>
                 </label>
-                <button class="action-btn" title="刷新 PR" @click="fetchRepoPRs" :disabled="repoDetail.prsLoading">🔄</button>
+                <button class="action-btn" title="刷新 PR" @click="fetchRepoPRs" :disabled="repoDetail.prsLoading">
+                  <span class="refresh-icon" :class="{ spinning: repoDetail.prsLoading }">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+                      <path d="M3 3v5h5"></path>
+                      <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path>
+                      <path d="M16 21h5v-5"></path>
+                    </svg>
+                  </span>
+                </button>
               </div>
 
               <div v-if="repoDetail.prsLoading" class="loading-state">
@@ -963,7 +1213,14 @@ onUnmounted(() => {
         <div v-if="showMergeModal" class="modal-overlay" @click.self="closeMergeModal">
           <div class="modal-container merge-modal">
             <div class="modal-header">
-              <h3>🔀 Merge Latest</h3>
+              <h3 class="modal-title-with-icon">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="18" cy="18" r="3"></circle>
+                  <circle cx="6" cy="6" r="3"></circle>
+                  <path d="M6 21V9a9 9 0 0 0 9 9"></path>
+                </svg>
+                <span>Merge Latest</span>
+              </h3>
               <button class="close-btn" @click="closeMergeModal">✕</button>
             </div>
             
@@ -1032,8 +1289,80 @@ onUnmounted(() => {
         </div>
       </Transition>
     </Teleport>
+    
+    <!-- AI Code Review Modal -->
+    <Teleport to="body">
+      <Transition name="modal">
+        <div v-if="showCodeReview" class="modal-overlay" @click.self="closeCodeReview">
+          <div class="modal-container code-review-modal">
+            <div class="modal-header">
+              <h3 class="modal-title-with-icon">
+                <span class="modal-icon">🔍</span>
+                AI Code Review
+              </h3>
+              <button class="modal-close" @click="closeCodeReview">✕</button>
+            </div>
+            <div class="modal-body code-review-body">
+              <div v-if="codeReviewLoading" class="review-loading">
+                <div class="loading-spinner"></div>
+                <p>正在分析代码变更...</p>
+              </div>
+              <div v-else-if="codeReviewError" class="review-error">
+                <span class="error-icon">❌</span>
+                <p>{{ codeReviewError }}</p>
+              </div>
+              <div v-else class="review-content" v-html="formatReviewContent(codeReviewResult)"></div>
+            </div>
+            <div class="modal-footer">
+              <button class="btn-secondary" @click="closeCodeReview">关闭</button>
+              <button 
+                class="btn-primary" 
+                @click="performCodeReview"
+                :disabled="codeReviewLoading"
+              >
+                {{ codeReviewLoading ? '分析中...' : '重新分析' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
+
+<script>
+// 格式化 Code Review 内容（处理 Markdown）
+function formatReviewContent(content) {
+  if (!content) return ''
+  
+  return content
+    // 转义 HTML
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    // 处理代码块
+    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>')
+    // 处理行内代码
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // 处理标题
+    .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+    // 处理加粗
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // 处理列表
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    .replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>')
+    // 处理换行
+    .replace(/\n/g, '<br>')
+}
+
+export default {
+  methods: {
+    formatReviewContent
+  }
+}
+</script>
 
 <style scoped>
 .git-module {
@@ -1159,6 +1488,14 @@ onUnmounted(() => {
 
 .tab-icon {
   font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-primary);
+}
+
+.tab-icon svg {
+  display: block;
 }
 
 .tab-count {
@@ -1252,6 +1589,188 @@ onUnmounted(() => {
 /* ============================================
    Repo Grid
    ============================================ */
+/* ========================================
+   关于我的 PR 汇总区域
+   ======================================== */
+.my-prs-section {
+  margin-bottom: 20px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.section-icon {
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-primary);
+}
+
+.section-icon svg {
+  display: block;
+}
+
+.section-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.section-count {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--accent-primary-bg);
+  color: var(--accent-primary);
+}
+
+.refresh-mini {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  transition: background 0.15s;
+}
+
+.refresh-mini:hover:not(:disabled) {
+  background: var(--glass-bg);
+}
+
+.refresh-mini:disabled {
+  opacity: 0.5;
+}
+
+.pr-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.my-prs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.my-pr-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.my-pr-item:hover {
+  background: var(--glass-bg-hover);
+  border-color: var(--accent-primary);
+  transform: translateY(-1px);
+}
+
+.my-pr-item.mine {
+  border-left: 3px solid #22d3ee;
+}
+
+.my-pr-item.reviewer {
+  border-left: 3px solid #f59e0b;
+}
+
+.my-pr-item.draft {
+  opacity: 0.7;
+}
+
+.pr-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pr-repo-badge {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--broker-color-bg, rgba(34, 211, 238, 0.15));
+  color: var(--broker-color, #22d3ee);
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+
+.pr-number {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.pr-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pr-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pr-branch {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: 'SF Mono', Monaco, monospace;
+}
+
+.pr-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.pr-tag.mine {
+  background: rgba(34, 211, 238, 0.15);
+  color: #22d3ee;
+}
+
+.pr-tag.review {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+}
+
+.pr-tag.draft {
+  background: rgba(100, 116, 139, 0.15);
+  color: #94a3b8;
+}
+
 .repo-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
@@ -2112,6 +2631,24 @@ onUnmounted(() => {
   animation: spin 1s linear infinite;
 }
 
+.refresh-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  transition: color 0.2s;
+}
+
+.refresh-icon svg {
+  display: block;
+}
+
+.refresh-btn:hover:not(:disabled) .refresh-icon,
+.refresh-mini:hover:not(:disabled) .refresh-icon,
+.action-btn:hover:not(:disabled) .refresh-icon {
+  color: var(--accent-primary);
+}
+
 /* ============================================
    Modal
    ============================================ */
@@ -2153,6 +2690,16 @@ onUnmounted(() => {
   font-weight: 600;
   color: var(--text-primary);
   margin: 0;
+}
+
+.modal-title-with-icon {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modal-title-with-icon svg {
+  color: var(--accent-primary);
 }
 
 .close-btn {
@@ -2331,5 +2878,146 @@ onUnmounted(() => {
 .modal-enter-from .modal-container,
 .modal-leave-to .modal-container {
   transform: scale(0.95);
+}
+
+/* ============================================
+   AI Code Review
+   ============================================ */
+.ai-review-btn {
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent-secondary);
+  background: var(--accent-secondary-glow);
+  border: 1px solid var(--accent-secondary);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-left: auto;
+}
+
+.ai-review-btn:hover:not(:disabled) {
+  background: var(--accent-secondary);
+  color: white;
+}
+
+.ai-review-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.code-review-modal {
+  max-width: 700px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.code-review-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  max-height: 60vh;
+}
+
+.review-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  gap: 16px;
+}
+
+.review-loading p {
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--glass-border);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.review-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 40px;
+  text-align: center;
+}
+
+.review-error .error-icon {
+  font-size: 32px;
+}
+
+.review-error p {
+  color: var(--error);
+  font-size: 14px;
+}
+
+.review-content {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-primary);
+}
+
+.review-content :deep(h2),
+.review-content :deep(h3),
+.review-content :deep(h4) {
+  margin: 16px 0 8px 0;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.review-content :deep(h2) {
+  font-size: 18px;
+}
+
+.review-content :deep(h3) {
+  font-size: 16px;
+}
+
+.review-content :deep(h4) {
+  font-size: 14px;
+}
+
+.review-content :deep(strong) {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+.review-content :deep(code) {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  padding: 2px 6px;
+  background: var(--glass-bg-hover);
+  border-radius: 4px;
+  color: var(--accent-secondary);
+}
+
+.review-content :deep(pre) {
+  margin: 12px 0;
+  padding: 12px;
+  background: var(--bg-gradient-start);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.review-content :deep(pre code) {
+  padding: 0;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.review-content :deep(li) {
+  margin: 4px 0;
+  padding-left: 8px;
 }
 </style>

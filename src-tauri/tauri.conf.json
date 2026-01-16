@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Dev Helper",
+  "productName": "FlowDesk",
   "version": "1.0.0",
-  "identifier": "com.devhelper.app",
+  "identifier": "com.flowdesk.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Dev Helper",
+        "title": "FlowDesk",
         "width": 1280,
         "height": 800,
         "resizable": true,

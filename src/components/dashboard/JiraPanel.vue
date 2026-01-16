@@ -9,7 +9,9 @@ const jiraConfig = ref({
   domain: localStorage.getItem('jira_domain') || 'thebidgroup.atlassian.net',
   email: localStorage.getItem('jira_email') || '',
   apiToken: localStorage.getItem('jira_token') || '',
-  project: localStorage.getItem('jira_project') || 'CRMCN'
+  project: localStorage.getItem('jira_project') || 'CRMCN',
+  // Teams 提测 Webhook URL（用于 Story 提测通知）
+  powerAutomateWebhook: localStorage.getItem('jira_power_automate_webhook') || ''
 })
 
 // 状态
@@ -126,29 +128,66 @@ const fetchIssues = async () => {
     
     if (result.status === 200) {
       const data = JSON.parse(result.body)
-      issues.value = (data.issues || []).map(issue => ({
-        id: issue.id,
-        key: issue.key,
-        summary: issue.fields?.summary || '',
-        status: issue.fields?.status?.name || 'Unknown',
-        statusCategory: issue.fields?.status?.statusCategory?.key || '',
-        type: issue.fields?.issuetype?.name || 'Task',
-        typeIcon: issue.fields?.issuetype?.iconUrl || '',
-        priority: issue.fields?.priority?.name || 'Medium',
-        priorityIcon: issue.fields?.priority?.iconUrl || '',
-        project: issue.fields?.project?.key || '',
-        projectName: issue.fields?.project?.name || '',
-        created: issue.fields?.created,
-        updated: issue.fields?.updated,
-        // 截止日期
-        dueDate: issue.fields?.duedate || null,
-        // 父任务/Epic 信息
-        parent: issue.fields?.parent ? {
-          key: issue.fields.parent.key,
-          summary: issue.fields.parent.fields?.summary || '',
-          type: issue.fields.parent.fields?.issuetype?.name || ''
-        } : null
-      }))
+      issues.value = (data.issues || []).map(issue => {
+        const fields = issue.fields || {}
+        
+        // 尝试获取"开发预计交付时间"自定义字段
+        // 常见的自定义字段名称可能是 customfield_10015, customfield_10016 等
+        // 遍历所有 customfield_ 开头的字段，查找包含日期的字段
+        let devDueDate = null
+        for (const key of Object.keys(fields)) {
+          if (key.startsWith('customfield_') && fields[key]) {
+            const val = fields[key]
+            // 如果是日期格式字符串 (YYYY-MM-DD)
+            if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) {
+              // 可能是开发预计交付时间，保存第一个找到的
+              if (!devDueDate) devDueDate = val
+            }
+          }
+        }
+        
+        // 优先使用特定的字段名（如果知道的话）
+        // customfield_10015 是常见的 "Dev Due Date" 字段
+        const specificDevDue = fields.customfield_10015 || fields.customfield_10016 || 
+                               fields.customfield_10036 || fields.customfield_10037
+        if (specificDevDue && typeof specificDevDue === 'string') {
+          devDueDate = specificDevDue
+        }
+        
+        return {
+          id: issue.id,
+          key: issue.key,
+          summary: fields.summary || '',
+          status: fields.status?.name || 'Unknown',
+          statusCategory: fields.status?.statusCategory?.key || '',
+          type: fields.issuetype?.name || 'Task',
+          typeIcon: fields.issuetype?.iconUrl || '',
+          priority: fields.priority?.name || 'Medium',
+          priorityIcon: fields.priority?.iconUrl || '',
+          project: fields.project?.key || '',
+          projectName: fields.project?.name || '',
+          created: fields.created,
+          updated: fields.updated,
+          // 截止日期 (Jira 原生 due date)
+          dueDate: fields.duedate || null,
+          // 开发预计交付时间 (自定义字段)
+          devDueDate: devDueDate,
+          // 父任务/Epic 信息
+          parent: fields.parent ? {
+            key: fields.parent.key,
+            summary: fields.parent.fields?.summary || '',
+            type: fields.parent.fields?.issuetype?.name || ''
+          } : null,
+          // 负责人信息
+          assignee: fields.assignee ? {
+            displayName: fields.assignee.displayName,
+            email: fields.assignee.emailAddress,
+            avatarUrl: fields.assignee.avatarUrls?.['48x48']
+          } : null,
+          // 任务链接
+          url: `https://${jiraConfig.value.domain}/browse/${issue.key}`
+        }
+      })
     } else if (result.status === 401) {
       error.value = '认证失败，请检查邮箱和 API Token'
       showConfig.value = true
@@ -175,6 +214,7 @@ const saveConfig = () => {
   localStorage.setItem('jira_email', jiraConfig.value.email)
   localStorage.setItem('jira_token', jiraConfig.value.apiToken)
   localStorage.setItem('jira_project', jiraConfig.value.project)
+  localStorage.setItem('jira_power_automate_webhook', jiraConfig.value.powerAutomateWebhook)
   showConfig.value = false
   connectionStatus.value = ''
   fetchIssues()
@@ -187,6 +227,13 @@ const cancelConfig = () => {
   jiraConfig.value.email = localStorage.getItem('jira_email') || ''
   jiraConfig.value.apiToken = localStorage.getItem('jira_token') || ''
   jiraConfig.value.project = localStorage.getItem('jira_project') || 'CRMCN'
+  jiraConfig.value.powerAutomateWebhook = localStorage.getItem('jira_power_automate_webhook') || ''
+}
+
+// 单独保存 Webhook 配置
+const saveWebhookConfig = () => {
+  localStorage.setItem('jira_power_automate_webhook', jiraConfig.value.powerAutomateWebhook)
+  alert('✅ Webhook URL 已保存')
 }
 
 // 获取类型配置 (图标 + 颜色)
@@ -275,6 +322,109 @@ const handleCreateBranch = (issue) => {
     summary: issue.summary,
     type: issue.type
   })
+}
+
+// 是否为 Story 类型
+const isStory = (issue) => {
+  return issue.type === 'Story'
+}
+
+// 触发提测通知状态
+const triggeringWebhook = ref(new Set())
+
+// 提测弹窗状态
+const showTestModal = ref(false)
+const currentTestIssue = ref(null)
+const testFormData = ref({
+  branch: '',
+  taskLink: '',
+  remark: '无',
+  config: '无',
+  script: '无',
+  assignee: ''
+})
+
+// 打开提测编辑弹窗
+const openTestModal = (issue) => {
+  currentTestIssue.value = issue
+  testFormData.value = {
+    branch: `epic/${issue.parent.key}`,
+    taskLink: issue.url,
+    remark: '无',
+    config: '无',
+    script: '无',
+    assignee: issue.assignee ? issue.assignee.displayName : '未分配'
+  }
+  showTestModal.value = true
+}
+
+// 关闭提测弹窗
+const closeTestModal = () => {
+  showTestModal.value = false
+  currentTestIssue.value = null
+}
+
+// 发送提测通知到 Teams
+const sendTestNotification = async () => {
+  const issue = currentTestIssue.value
+  const webhookUrl = jiraConfig.value.powerAutomateWebhook
+  
+  if (!webhookUrl) {
+    alert('⚠️ 请先配置 Teams Webhook URL')
+    return
+  }
+  
+  triggeringWebhook.value.add(issue.key)
+  error.value = ''
+  
+  try {
+    // 提测消息格式
+    const message = {
+      text: `**【提测】${issue.summary}**\n\n` +
+            `【分支】：${testFormData.value.branch}\n\n` +
+            `【任务】：${testFormData.value.taskLink}\n\n` +
+            `【备注】：${testFormData.value.remark}\n\n` +
+            `【配置】：${testFormData.value.config}\n\n` +
+            `【脚本】：${testFormData.value.script}\n\n` +
+            `【负责人】：${testFormData.value.assignee}`
+    }
+    
+    const result = await invoke('http_post_json', {
+      url: webhookUrl,
+      body: JSON.stringify(message)
+    })
+    
+    if (result.status >= 200 && result.status < 300) {
+      alert(`✅ 提测通知已发送到 Teams\n任务: ${issue.key}`)
+      closeTestModal()
+    } else {
+      throw new Error(`HTTP ${result.status}`)
+    }
+  } catch (e) {
+    console.error('提测通知发送失败:', e)
+    error.value = `发送失败: ${e.message || e}`
+    alert(`❌ 发送失败: ${e.message || e}`)
+  } finally {
+    triggeringWebhook.value.delete(issue.key)
+  }
+}
+
+// 触发提测通知到 Teams（仅 Story 类型且有 Epic）
+const triggerPowerAutomate = (issue) => {
+  // 检查是否有 Epic 信息
+  if (!issue.parent || issue.parent.type !== 'Epic') {
+    alert('⚠️ 该 Story 没有关联 Epic，无法生成提测消息')
+    return
+  }
+  
+  const webhookUrl = jiraConfig.value.powerAutomateWebhook
+  if (!webhookUrl) {
+    alert('⚠️ 请先配置 Teams Webhook URL')
+    return
+  }
+  
+  // 打开提测编辑弹窗
+  openTestModal(issue)
 }
 
 // 打开 Jira 链接
@@ -376,6 +526,26 @@ onUnmounted(() => {
         
         <div class="config-hint">
           <p>💡 Jira 配置已移至全局设置，点击下方按钮前往设置</p>
+        </div>
+        
+        <!-- Teams 提测 Webhook 配置 -->
+        <div class="webhook-config">
+          <label class="webhook-label">
+            🚀 Teams 提测 Webhook
+          </label>
+          <input 
+            type="text" 
+            v-model="jiraConfig.powerAutomateWebhook"
+            placeholder="https://xxx.webhook.office.com/..."
+            class="webhook-input"
+          />
+          <button 
+            class="btn-sm" 
+            @click="saveWebhookConfig"
+            :disabled="!jiraConfig.powerAutomateWebhook"
+          >
+            保存 Webhook
+          </button>
         </div>
         
         <!-- 测试连接 -->
@@ -495,6 +665,20 @@ onUnmounted(() => {
               🔀 创建分支
             </button>
           </div>
+          
+          <!-- Story 类型显示提测按钮 -->
+          <div v-if="isStory(issue)" class="task-actions">
+            <button 
+              class="trigger-webhook-btn" 
+              :class="{ 'is-loading': triggeringWebhook.has(issue.key) }"
+              :disabled="triggeringWebhook.has(issue.key) || !jiraConfig.powerAutomateWebhook || !issue.parent || issue.parent.type !== 'Epic'"
+              @click="triggerPowerAutomate(issue)"
+              :title="!jiraConfig.powerAutomateWebhook ? '请先配置 Webhook URL' : (!issue.parent || issue.parent.type !== 'Epic') ? '该 Story 未关联 Epic，无法提测' : '发送提测通知到 Teams'"
+            >
+              <span v-if="triggeringWebhook.has(issue.key)">⏳ 提测中...</span>
+              <span v-else>🚀 提测</span>
+            </button>
+          </div>
         </div>
       </div>
       
@@ -509,6 +693,105 @@ onUnmounted(() => {
     <div class="panel-footer">
       <span class="footer-text">{{ jiraConfig.domain }}</span>
       <span v-if="stats.inProgress" class="progress-badge">{{ stats.inProgress }} 进行中</span>
+    </div>
+  </div>
+  
+  <!-- 提测编辑弹窗 -->
+  <div v-if="showTestModal" class="test-modal-overlay" @click.self="closeTestModal">
+    <div class="test-modal">
+      <div class="test-modal-header">
+        <h3>📝 编辑提测信息</h3>
+        <button class="modal-close-btn" @click="closeTestModal">✕</button>
+      </div>
+      
+      <div class="test-modal-body">
+        <div v-if="currentTestIssue" class="test-issue-info">
+          <div class="issue-title">
+            <span class="issue-key">{{ currentTestIssue.key }}</span>
+            <span class="issue-summary">{{ currentTestIssue.summary }}</span>
+          </div>
+        </div>
+        
+        <div class="test-form">
+          <div class="form-group">
+            <label class="form-label">
+              <span class="label-text">分支</span>
+              <span class="label-required">*</span>
+            </label>
+            <input 
+              type="text" 
+              v-model="testFormData.branch" 
+              class="form-input"
+              placeholder="epic/CRMCN-xxxx"
+            />
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">
+              <span class="label-text">任务链接</span>
+              <span class="label-required">*</span>
+            </label>
+            <input 
+              type="text" 
+              v-model="testFormData.taskLink" 
+              class="form-input"
+              placeholder="https://..."
+            />
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">备注</label>
+            <textarea 
+              v-model="testFormData.remark" 
+              class="form-textarea"
+              rows="3"
+              placeholder="无"
+            ></textarea>
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">配置</label>
+            <textarea 
+              v-model="testFormData.config" 
+              class="form-textarea"
+              rows="3"
+              placeholder="无"
+            ></textarea>
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">脚本</label>
+            <textarea 
+              v-model="testFormData.script" 
+              class="form-textarea"
+              rows="3"
+              placeholder="无"
+            ></textarea>
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">负责人</label>
+            <input 
+              type="text" 
+              v-model="testFormData.assignee" 
+              class="form-input"
+              placeholder="未分配"
+            />
+          </div>
+        </div>
+      </div>
+      
+      <div class="test-modal-footer">
+        <button class="btn-cancel" @click="closeTestModal">取消</button>
+        <button 
+          class="btn-confirm" 
+          @click="sendTestNotification"
+          :disabled="triggeringWebhook.has(currentTestIssue?.key)"
+        >
+          <span v-if="triggeringWebhook.has(currentTestIssue?.key)">⏳ 发送中...</span>
+          <span v-else>✅ 确认提测</span>
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -1132,6 +1415,92 @@ onUnmounted(() => {
   filter: brightness(1.1);
 }
 
+/* Trigger Webhook Button (Story) */
+.trigger-webhook-btn {
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent-warm);
+  background: var(--accent-warm-glow);
+  border: 1px solid var(--accent-warm);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.trigger-webhook-btn:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.trigger-webhook-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.trigger-webhook-btn.is-loading {
+  opacity: 0.7;
+}
+
+/* Webhook Config */
+.webhook-config {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--glass-bg);
+  border: 1px solid var(--accent-warm);
+  border-radius: 8px;
+}
+
+.webhook-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-warm);
+}
+
+.webhook-input {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-primary);
+  background: var(--bg-gradient-start);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.webhook-input:focus {
+  border-color: var(--accent-warm);
+}
+
+.webhook-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+.btn-sm {
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent-warm);
+  background: transparent;
+  border: 1px solid var(--accent-warm);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-sm:hover:not(:disabled) {
+  background: var(--accent-warm-glow);
+}
+
+.btn-sm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Empty State */
 .empty-state {
   display: flex;
@@ -1176,5 +1545,228 @@ onUnmounted(() => {
   color: var(--accent-secondary);
   background: var(--accent-secondary-glow);
   border-radius: 4px;
+}
+
+/* 提测编辑弹窗 */
+.test-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.test-modal {
+  width: 90%;
+  max-width: 600px;
+  max-height: 85vh;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: 16px;
+  overflow: hidden;
+  animation: slideUp 0.3s ease;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.test-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--glass-border);
+  background: var(--glass-bg-hover);
+}
+
+.test-modal-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.modal-close-btn {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-tertiary);
+  font-size: 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.modal-close-btn:hover {
+  background: var(--glass-border);
+  color: var(--text-primary);
+}
+
+.test-modal-body {
+  padding: 24px;
+  max-height: calc(85vh - 160px);
+  overflow-y: auto;
+}
+
+.test-issue-info {
+  margin-bottom: 20px;
+  padding: 12px 16px;
+  background: var(--accent-secondary-glow);
+  border: 1px solid var(--accent-secondary);
+  border-radius: 8px;
+}
+
+.issue-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.issue-key {
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--accent-secondary);
+  background: var(--glass-bg);
+  border-radius: 4px;
+}
+
+.issue-summary {
+  font-size: 14px;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.test-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.form-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.label-text {
+  color: var(--text-primary);
+}
+
+.label-required {
+  color: var(--error);
+}
+
+.form-input,
+.form-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text-primary);
+  background: var(--bg-gradient-start);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  outline: none;
+  transition: all 0.2s;
+  resize: vertical;
+}
+
+.form-input:focus,
+.form-textarea:focus {
+  border-color: var(--accent-secondary);
+  background: var(--glass-bg-hover);
+}
+
+.form-textarea {
+  min-height: 80px;
+  line-height: 1.5;
+}
+
+.test-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--glass-border);
+  background: var(--glass-bg-hover);
+}
+
+.btn-cancel,
+.btn-confirm {
+  padding: 10px 20px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-cancel {
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--glass-border);
+}
+
+.btn-cancel:hover {
+  background: var(--glass-bg);
+  border-color: var(--glass-border-strong);
+}
+
+.btn-confirm {
+  color: white;
+  background: linear-gradient(135deg, var(--accent-secondary), var(--accent-primary));
+  border: none;
+  box-shadow: 0 4px 12px var(--accent-secondary-glow);
+}
+
+.btn-confirm:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px var(--accent-secondary-glow);
+}
+
+.btn-confirm:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 </style>

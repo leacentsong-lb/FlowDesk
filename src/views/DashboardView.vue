@@ -2,7 +2,7 @@
 import { ref, computed } from 'vue'
 import JiraPanel from '../components/dashboard/JiraPanel.vue'
 import HotTopicsPanel from '../components/dashboard/HotTopicsPanel.vue'
-import QuickNotesPanel from '../components/dashboard/QuickNotesPanel.vue'
+import TodoListPanel from '../components/dashboard/TodoListPanel.vue'
 import CreateBranchModal from '../components/dashboard/CreateBranchModal.vue'
 
 // 分支创建弹窗
@@ -25,6 +25,11 @@ const greeting = computed(() => {
   if (hour < 18) return 'Good Afternoon! 🌤'
   return 'Good Evening! 🌙'
 })
+
+// 打开 AI 聊天
+const openAIChat = () => {
+  window.dispatchEvent(new CustomEvent('open-ai-chat'))
+}
 </script>
 
 <template>
@@ -35,6 +40,9 @@ const greeting = computed(() => {
         <p>准备开始新的一天吧</p>
       </div>
       <div class="header-meta">
+        <button class="ai-chat-btn" @click="openAIChat" title="AI 助手 (⌘+K)">
+          🤖 AI 助手
+        </button>
         <span class="date">{{ new Date().toLocaleDateString('zh-CN', { weekday: 'long', month: 'long', day: 'numeric' }) }}</span>
       </div>
     </div>
@@ -47,7 +55,7 @@ const greeting = computed(() => {
         <HotTopicsPanel />
       </div>
       <div class="grid-col">
-        <QuickNotesPanel />
+        <TodoListPanel />
       </div>
     </div>
     
@@ -98,7 +106,29 @@ const greeting = computed(() => {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 4px;
+  gap: 8px;
+}
+
+.ai-chat-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent-secondary);
+  background: var(--accent-secondary-glow);
+  border: 1px solid var(--accent-secondary);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.ai-chat-btn:hover {
+  background: var(--accent-secondary);
+  color: white;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px var(--accent-secondary-glow);
 }
 
 .date {
@@ -108,8 +138,8 @@ const greeting = computed(() => {
 
 .dashboard-grid {
   display: grid;
-  /* Jira 和 热点 各占 2fr，Quick Notes 占 1fr */
-  grid-template-columns: 2fr 2fr 1fr;
+  /* Jira : 热点 : Todo = 4:4:2 */
+  grid-template-columns: 4fr 4fr 2fr;
   gap: 20px;
   flex: 1;
   min-height: 0;
@@ -121,6 +151,11 @@ const greeting = computed(() => {
   flex-direction: column;
 }
 
+/* Todo 列限制最大宽度 */
+.grid-col:nth-child(3) {
+  max-width: 320px;
+}
+
 /* Responsive adjustments */
 @media (max-width: 1200px) {
   .dashboard-grid {
@@ -129,6 +164,7 @@ const greeting = computed(() => {
   
   .grid-col:nth-child(3) {
     grid-column: span 2;
+    max-width: none;
   }
 }
 
@@ -139,6 +175,7 @@ const greeting = computed(() => {
   
   .grid-col:nth-child(3) {
     grid-column: span 1;
+    max-width: none;
   }
 }
 </style>

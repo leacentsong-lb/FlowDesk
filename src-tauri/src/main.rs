@@ -6,12 +6,124 @@ use std::process::Command;
 use regex::Regex;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use base64::Engine;
 
 // HTTP 响应结构
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
+}
+
+// ============================================
+// Screenshot (macOS MVP)
+// ============================================
+
+#[tauri::command]
+async fn screenshot_capture_region() -> Result<HttpResponse, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return tauri::async_runtime::spawn_blocking(move || {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("Failed to get timestamp: {}", e))?
+                .as_millis();
+
+            let mut tmp = std::env::temp_dir();
+            tmp.push(format!("dev-helper-shot-{}.png", ts));
+
+            let out = Command::new("screencapture")
+                .args(["-i", "-x"])
+                .arg(&tmp)
+                .output()
+                .map_err(|e| format!("Failed to run screencapture: {}", e))?;
+
+            // User cancelled selection: treat as no-content (silent cancel in UI)
+            if !out.status.success() {
+                // Clean up temp file if created
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(HttpResponse {
+                    status: 204,
+                    body: "CANCELLED".to_string(),
+                });
+            }
+
+            let bytes = std::fs::read(&tmp).map_err(|e| format!("Failed to read screenshot: {}", e))?;
+            let _ = std::fs::remove_file(&tmp);
+
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            Ok(HttpResponse { status: 200, body: b64 })
+        })
+        .await
+        .map_err(|e| format!("Failed to spawn blocking task: {}", e))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("screenshot_capture_region is only supported on macOS in MVP".to_string())
+    }
+}
+
+#[tauri::command]
+async fn clipboard_write_image_png(png_base64: String) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return tauri::async_runtime::spawn_blocking(move || {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(png_base64.as_bytes())
+                .map_err(|e| format!("Failed to decode base64 png: {}", e))?;
+
+            let mut tmp = std::env::temp_dir();
+            tmp.push(format!("dev-helper-clipboard-{}.png", std::process::id()));
+            std::fs::write(&tmp, bytes).map_err(|e| format!("Failed to write temp png: {}", e))?;
+
+            // Use AppleScript to set clipboard image from file as PNG
+            let script = format!(
+                "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
+                tmp.display()
+            );
+            let out = Command::new("osascript")
+                .args(["-e", &script])
+                .output()
+                .map_err(|e| format!("Failed to run osascript: {}", e))?;
+
+            let _ = std::fs::remove_file(&tmp);
+
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).to_string());
+            }
+
+            Ok("Copied to clipboard".to_string())
+        })
+        .await
+        .map_err(|e| format!("Failed to spawn blocking task: {}", e))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("clipboard_write_image_png is only supported on macOS in MVP".to_string())
+    }
+}
+
+#[tauri::command]
+async fn screenshot_save_png(png_base64: String, path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(png_base64.as_bytes())
+            .map_err(|e| format!("Failed to decode base64 png: {}", e))?;
+
+        let p = std::path::PathBuf::from(path.clone());
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory: {}", e))?;
+        }
+
+        std::fs::write(&p, bytes).map_err(|e| format!("Failed to save png: {}", e))?;
+        Ok(format!("Saved: {}", path))
+    })
+    .await
+    .map_err(|e| format!("Failed to spawn blocking task: {}", e))?
 }
 
 // Admin 登录请求
@@ -89,6 +201,26 @@ async fn http_get_member_token(url: String, token: String) -> Result<HttpRespons
     let body = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
     
     Ok(HttpResponse { status, body })
+}
+
+// 通用 POST JSON 请求（用于 Webhook 等）
+#[tauri::command]
+async fn http_post_json(url: String, body: String) -> Result<HttpResponse, String> {
+    let client = reqwest::Client::new();
+    
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    
+    let status = response.status().as_u16();
+    let response_body = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    
+    Ok(HttpResponse { status, body: response_body })
 }
 
 #[tauri::command]
@@ -299,8 +431,9 @@ async fn jira_get_my_issues(domain: String, email: String, api_token: String, _p
     
     // 新 API 使用 GET 方法，参数放在 URL 中
     // 添加 parent 字段获取父任务/Epic 信息
+    // 使用 *navigable 获取所有可导航字段（包括自定义字段如开发预计交付时间）
     let url = format!(
-        "https://{}/rest/api/3/search/jql?jql={}&maxResults=100&fields=summary,status,issuetype,priority,project,created,updated,parent,duedate",
+        "https://{}/rest/api/3/search/jql?jql={}&maxResults=100&fields=*navigable",
         domain,
         urlencoding::encode(jql)
     );
@@ -1117,8 +1250,359 @@ async fn fetch_rss_feed(url: String) -> Result<HttpResponse, String> {
     Ok(HttpResponse { status, body })
 }
 
+// ============================================
+// AI Service
+// ============================================
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AIConfig {
+    pub provider: String,    // "openai" | "anthropic" | "ollama"
+    pub api_key: String,
+    pub model: String,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,      // "user" | "assistant" | "system"
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AIRequest {
+    pub messages: Vec<ChatMessage>,
+    pub system_prompt: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+#[tauri::command]
+async fn ai_chat_completion(config: AIConfig, request: AIRequest) -> Result<HttpResponse, String> {
+    match config.provider.as_str() {
+        "openai" => call_openai(config, request).await,
+        "anthropic" => call_anthropic(config, request).await,
+        "ollama" => call_ollama(config, request).await,
+        // OpenAI 兼容的提供商
+        "deepseek" => call_openai_compatible(config, request, "https://api.deepseek.com/v1").await,
+        "zhipu" => call_openai_compatible(config, request, "https://open.bigmodel.cn/api/paas/v4").await,
+        "moonshot" => call_openai_compatible(config, request, "https://api.moonshot.cn/v1").await,
+        "qwen" => call_openai_compatible(config, request, "https://dashscope.aliyuncs.com/compatible-mode/v1").await,
+        "groq" => call_openai_compatible(config, request, "https://api.groq.com/openai/v1").await,
+        _ => Err(format!("Unsupported AI provider: {}", config.provider))
+    }
+}
+
+async fn call_openai(config: AIConfig, request: AIRequest) -> Result<HttpResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let base_url = config.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    
+    // Build messages array
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    
+    // Add system prompt if provided
+    if let Some(system_prompt) = &request.system_prompt {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system_prompt
+        }));
+    }
+    
+    // Add chat messages
+    for msg in &request.messages {
+        messages.push(serde_json::json!({
+            "role": msg.role,
+            "content": msg.content
+        }));
+    }
+    
+    let payload = serde_json::json!({
+        "model": config.model,
+        "messages": messages,
+        "temperature": request.temperature.unwrap_or(0.7),
+        "max_tokens": request.max_tokens.unwrap_or(2000)
+    });
+    
+    let response = client
+        .post(format!("{}/chat/completions", base_url))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI request failed: {}", e))?;
+    
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(|e| format!("Failed to read OpenAI response: {}", e))?;
+    
+    // Parse and extract content for easier frontend handling
+    if status == 200 {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
+                return Ok(HttpResponse {
+                    status,
+                    body: serde_json::json!({
+                        "content": content,
+                        "raw": json
+                    }).to_string()
+                });
+            }
+        }
+    }
+    
+    Ok(HttpResponse { status, body })
+}
+
+async fn call_anthropic(config: AIConfig, request: AIRequest) -> Result<HttpResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let base_url = config.base_url.unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
+    
+    // Build messages array (Anthropic format)
+    let messages: Vec<serde_json::Value> = request.messages.iter().map(|msg| {
+        serde_json::json!({
+            "role": msg.role,
+            "content": msg.content
+        })
+    }).collect();
+    
+    let mut payload = serde_json::json!({
+        "model": config.model,
+        "messages": messages,
+        "max_tokens": request.max_tokens.unwrap_or(2000)
+    });
+    
+    // Add system prompt if provided (Anthropic uses top-level system field)
+    if let Some(system_prompt) = &request.system_prompt {
+        payload["system"] = serde_json::Value::String(system_prompt.clone());
+    }
+    
+    let response = client
+        .post(format!("{}/messages", base_url))
+        .header("Content-Type", "application/json")
+        .header("x-api-key", &config.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Anthropic request failed: {}", e))?;
+    
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(|e| format!("Failed to read Anthropic response: {}", e))?;
+    
+    // Parse and extract content
+    if status == 200 {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(content) = json["content"][0]["text"].as_str() {
+                return Ok(HttpResponse {
+                    status,
+                    body: serde_json::json!({
+                        "content": content,
+                        "raw": json
+                    }).to_string()
+                });
+            }
+        }
+    }
+    
+    Ok(HttpResponse { status, body })
+}
+
+async fn call_ollama(config: AIConfig, request: AIRequest) -> Result<HttpResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))  // Ollama 本地模型可能较慢
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let base_url = config.base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
+    
+    // Build messages array
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    
+    // Add system prompt if provided
+    if let Some(system_prompt) = &request.system_prompt {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system_prompt
+        }));
+    }
+    
+    // Add chat messages
+    for msg in &request.messages {
+        messages.push(serde_json::json!({
+            "role": msg.role,
+            "content": msg.content
+        }));
+    }
+    
+    let payload = serde_json::json!({
+        "model": config.model,
+        "messages": messages,
+        "stream": false,
+        "options": {
+            "temperature": request.temperature.unwrap_or(0.7)
+        }
+    });
+    
+    let response = client
+        .post(format!("{}/api/chat", base_url))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Ollama request failed: {}", e))?;
+    
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(|e| format!("Failed to read Ollama response: {}", e))?;
+    
+    // Parse and extract content
+    if status == 200 {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(content) = json["message"]["content"].as_str() {
+                return Ok(HttpResponse {
+                    status,
+                    body: serde_json::json!({
+                        "content": content,
+                        "raw": json
+                    }).to_string()
+                });
+            }
+        }
+    }
+    
+    Ok(HttpResponse { status, body })
+}
+
+// OpenAI 兼容的 API 调用（用于 DeepSeek、智谱、Moonshot 等）
+async fn call_openai_compatible(config: AIConfig, request: AIRequest, default_base_url: &str) -> Result<HttpResponse, String> {
+    println!("[AI] call_openai_compatible - provider: {}, model: {}, base_url: {:?}", 
+             config.provider, config.model, config.base_url);
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let base_url = config.base_url.unwrap_or_else(|| default_base_url.to_string());
+    
+    println!("[AI] Using base_url: {}", base_url);
+    
+    // Build messages array
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    
+    // Add system prompt if provided
+    if let Some(system_prompt) = &request.system_prompt {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system_prompt
+        }));
+    }
+    
+    // Add chat messages
+    for msg in &request.messages {
+        messages.push(serde_json::json!({
+            "role": msg.role,
+            "content": msg.content
+        }));
+    }
+    
+    // 智谱 AI 不支持 max_tokens 参数，需要根据提供商调整
+    let payload = if config.provider == "zhipu" {
+        serde_json::json!({
+            "model": config.model,
+            "messages": messages,
+            "temperature": request.temperature.unwrap_or(0.7),
+            "stream": false
+        })
+    } else {
+        serde_json::json!({
+            "model": config.model,
+            "messages": messages,
+            "temperature": request.temperature.unwrap_or(0.7),
+            "max_tokens": request.max_tokens.unwrap_or(2000),
+            "stream": false
+        })
+    };
+    
+    let url = format!("{}/chat/completions", base_url);
+    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+    println!("[AI] Sending request to: {}", url);
+    println!("[AI] Request payload: {}", payload_str);
+    println!("[AI] API Key (first 10 chars): {}...", &config.api_key[..std::cmp::min(10, config.api_key.len())]);
+    
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .body(payload_str.clone())
+        .send()
+        .await
+        .map_err(|e| {
+            println!("[AI] Request failed: {}", e);
+            format!("API request failed: {}", e)
+        })?;
+    
+    let status = response.status().as_u16();
+    println!("[AI] Response status: {}", status);
+    
+    let body = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    println!("[AI] Response body length: {} bytes", body.len());
+    if status != 200 {
+        println!("[AI] Error response: {}", body);
+    }
+    
+    // Parse and extract content (OpenAI format)
+    if status == 200 {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
+                return Ok(HttpResponse {
+                    status,
+                    body: serde_json::json!({
+                        "content": content,
+                        "raw": json
+                    }).to_string()
+                });
+            }
+        }
+    }
+    
+    Ok(HttpResponse { status, body })
+}
+
+// Git diff command for code review
+#[tauri::command]
+async fn git_get_diff(repo_path: String) -> Result<HttpResponse, String> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "HEAD"])
+        .current_dir(&repo_path)
+        .output()
+        .map_err(|e| format!("Failed to run git diff: {}", e))?;
+    
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+    
+    // If no staged changes, try unstaged
+    let diff = if diff.is_empty() {
+        let output = std::process::Command::new("git")
+            .args(["diff"])
+            .current_dir(&repo_path)
+            .output()
+            .map_err(|e| format!("Failed to run git diff: {}", e))?;
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else {
+        diff
+    };
+    
+    Ok(HttpResponse {
+        status: 200,
+        body: diff
+    })
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
@@ -1130,6 +1614,11 @@ fn main() {
             http_admin_login,
             http_get_user_list,
             http_get_member_token,
+            http_post_json,
+            // Screenshot
+            screenshot_capture_region,
+            clipboard_write_image_png,
+            screenshot_save_png,
             // Jira
             jira_get_my_issues,
             jira_get_projects,
@@ -1153,7 +1642,10 @@ fn main() {
             github_list_open_prs,
             github_get_current_user,
             // RSS
-            fetch_rss_feed
+            fetch_rss_feed,
+            // AI
+            ai_chat_completion,
+            git_get_diff
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,20 +1,130 @@
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import DashboardView from './views/DashboardView.vue'
 import DevPanelView from './views/DevPanelView.vue'
 import FloatingDock from './components/dock/FloatingDock.vue'
 import ThemeSwitcher from './components/ThemeSwitcher.vue'
+import AIChatWindow from './components/ai/AIChatWindow.vue'
 import { initTheme } from './config'
+import { register, unregisterAll } from '@tauri-apps/plugin-global-shortcut'
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
+import { emit } from '@tauri-apps/api/event'
+import { AIConfigManager } from './services/ai-service'
 
 // 当前视图
 const currentView = ref('dashboard')
 
 // 设置抽屉状态（全局）
 const settingsOpen = ref(false)
-const settingsTab = ref('projects') // projects | jira | github
+const settingsTab = ref('projects') // projects | jira | github | ai
+
+// AI 聊天窗口状态
+const showAIChat = ref(false)
+
+// AI 配置
+const aiConfig = reactive(AIConfigManager.getConfig())
+const aiTestingConnection = ref(false)
+const aiConnectionStatus = ref('') // 'success' | 'error' | ''
+const customModelName = ref('') // 自定义模型名称
+
+// 计算当前提供商可用的模型列表
+const availableModels = computed(() => {
+  return AIConfigManager.getProviderModels(aiConfig.provider)
+})
+
+// 监听提供商变化，自动更新默认模型
+watch(() => aiConfig.provider, (newProvider) => {
+  aiConfig.model = AIConfigManager.getDefaultModel(newProvider)
+  customModelName.value = '' // 重置自定义模型
+  aiConnectionStatus.value = '' // 重置连接状态
+})
+
+// 应用自定义模型名称
+const applyCustomModel = () => {
+  if (customModelName.value.trim()) {
+    aiConfig.model = customModelName.value.trim()
+  }
+}
+
+// AI 配置保存
+const saveAIConfig = () => {
+  AIConfigManager.saveConfig({ ...aiConfig })
+  alert('✅ AI 配置已保存')
+}
+
+// AI 连接测试
+const testAIConnection = async () => {
+  // 确保使用当前 UI 选择的配置
+  AIConfigManager.saveConfig({ ...aiConfig })
+
+  aiTestingConnection.value = true
+  aiConnectionStatus.value = ''
+  
+  try {
+    const result = await AIConfigManager.testConnection()
+    if (result.success) {
+      aiConnectionStatus.value = 'success'
+    } else {
+      aiConnectionStatus.value = 'error'
+      alert(`❌ 连接失败: ${result.error}`)
+    }
+  } catch (e) {
+    aiConnectionStatus.value = 'error'
+    alert(`❌ 连接失败: ${e.message || e}`)
+  } finally {
+    aiTestingConnection.value = false
+  }
+}
+
+// 获取模型占位符
+const getModelPlaceholder = (provider) => {
+  const placeholders = {
+    openai: 'gpt-4o, gpt-4-turbo, gpt-3.5-turbo',
+    anthropic: 'claude-3-5-sonnet-20241022, claude-3-opus-20240229',
+    deepseek: 'deepseek-chat, deepseek-coder',
+    zhipu: 'glm-4, glm-4-flash, glm-3-turbo',
+    moonshot: 'moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k',
+    qwen: 'qwen-turbo, qwen-plus, qwen-max',
+    groq: 'llama-3.1-70b-versatile, mixtral-8x7b-32768',
+    ollama: 'llama2, codellama, mistral, qwen'
+  }
+  return placeholders[provider] || ''
+}
+
+// 获取 API Key 占位符
+const getApiKeyPlaceholder = (provider) => {
+  const placeholders = {
+    openai: 'sk-xxxx...',
+    anthropic: 'sk-ant-api...',
+    deepseek: 'sk-xxxx...',
+    zhipu: 'xxxx.xxxx...',
+    moonshot: 'sk-xxxx...',
+    qwen: 'sk-xxxx...',
+    groq: 'gsk_xxxx...'
+  }
+  return placeholders[provider] || 'API Key'
+}
+
+// 获取 API Key 提示
+const getApiKeyHint = (provider) => {
+  const hints = {
+    openai: '从 platform.openai.com 获取',
+    anthropic: '从 console.anthropic.com 获取',
+    deepseek: '从 platform.deepseek.com 获取',
+    zhipu: '从 open.bigmodel.cn 获取',
+    moonshot: '从 platform.moonshot.cn 获取',
+    qwen: '从 dashscope.console.aliyun.com 获取',
+    groq: '从 console.groq.com 获取'
+  }
+  return hints[provider] || '输入 API Key'
+}
 
 // Spotlight 搜索状态
 const spotlightOpen = ref(false)
+
+// Screenshot state
+const screenshotBusy = ref(false)
+let screenshotWindowCounter = 0
 
 // ============================================
 // 项目路径设置
@@ -209,6 +319,89 @@ const handleKeydown = (event) => {
   }
 }
 
+const runScreenshotFlow = async () => {
+  if (screenshotBusy.value) return
+  screenshotBusy.value = true
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const res = await invoke('screenshot_capture_region')
+    // 204 = user cancelled (silent)
+    if (res?.status === 204) return
+    if (res?.status !== 200 || !res?.body) return
+    
+    // Create a new floating window for the screenshot
+    const windowLabel = `screenshot-${++screenshotWindowCounter}`
+    const webview = new WebviewWindow(windowLabel, {
+      url: '/#/screenshot-float',
+      title: '截图',
+      width: 800,
+      height: 600,
+      center: true,
+      resizable: true,
+      decorations: false,
+      alwaysOnTop: true,
+      transparent: false,
+      skipTaskbar: false,
+      focus: true,
+      visible: true  // Show immediately, resize after content loaded
+    })
+    
+    // Wait for window to be created, then send the screenshot data
+    webview.once('tauri://created', async () => {
+      // Small delay to ensure the window's JS is loaded
+      setTimeout(async () => {
+        try {
+          await emit('screenshot-data', { base64: res.body }, { target: { label: windowLabel } })
+        } catch (e) {
+          console.warn('Failed to emit screenshot data:', e)
+        }
+      }, 300)
+    })
+    
+    webview.once('tauri://error', (e) => {
+      console.error('Failed to create screenshot window:', e)
+    })
+  } catch (e) {
+    console.error('Screenshot flow error:', e)
+  } finally {
+    screenshotBusy.value = false
+  }
+}
+
+const registerScreenshotShortcut = async () => {
+  // Try a couple of accelerator formats for robustness
+  // Note: Cmd+Shift+2 is a macOS system screenshot shortcut and may not be overridable.
+  // Use a non-conflicting default first.
+  // User preference: Cmd+5
+  const candidates = ['Command+5', 'CommandOrControl+Shift+S', 'CommandOrControl+Shift+2', 'Command+Shift+2']
+  for (const acc of candidates) {
+    try {
+      await register(acc, () => runScreenshotFlow())
+      return acc
+    } catch {
+      // try next
+    }
+  }
+  return ''
+}
+
+// 注册 Cmd+K 快捷键打开 AI 聊天
+const registerAIChatShortcut = async () => {
+  try {
+    await register('CommandOrControl+K', () => {
+      showAIChat.value = true
+    })
+    console.log('AI chat shortcut registered: Cmd+K')
+  } catch (e) {
+    console.warn('Failed to register AI chat shortcut:', e)
+  }
+}
+
+// 处理打开 AI 聊天事件
+const handleOpenAIChatEvent = () => {
+  showAIChat.value = true
+}
+
 onMounted(() => {
   // 初始化主题
   initTheme()
@@ -221,11 +414,21 @@ onMounted(() => {
   } catch {}
   window.addEventListener('keydown', handleKeydown)
   window.addEventListener('open-settings', handleOpenSettingsEvent)
+  window.addEventListener('open-ai-chat', handleOpenAIChatEvent)
+
+  // Global shortcut for screenshot
+  // Requires capability permissions: global-shortcut:allow-register
+  registerScreenshotShortcut()
+  
+  // 注册 Cmd+K 打开 AI 聊天快捷键
+  registerAIChatShortcut()
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('open-settings', handleOpenSettingsEvent)
+  window.removeEventListener('open-ai-chat', handleOpenAIChatEvent)
+  unregisterAll().catch(() => {})
 })
 </script>
 
@@ -233,6 +436,24 @@ onUnmounted(() => {
   <div class="app-container">
     <!-- 主题切换器 -->
     <ThemeSwitcher />
+
+    <!-- Screenshot quick button (bottom-left) -->
+    <button
+      class="screenshot-fab"
+      :disabled="screenshotBusy"
+      @click="runScreenshotFlow"
+      title="截图（⌘5）"
+      aria-label="截图（⌘5）"
+    >
+      <svg class="screenshot-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <!-- Scissors/Crop icon for screenshot -->
+        <path d="M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M20 4L8.12 15.88" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M14.47 14.48L20 20" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M8.12 8.12L12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
     
     <!-- 背景效果 -->
     <div class="background-effects">
@@ -257,6 +478,7 @@ onUnmounted(() => {
       @open-settings="handleOpenSettings"
       @open-spotlight="handleOpenSpotlight"
     />
+
     
     <!-- Spotlight 搜索 (占位) -->
     <Transition name="fade">
@@ -310,6 +532,13 @@ onUnmounted(() => {
               @click="settingsTab = 'github'"
             >
               🐙 GitHub
+            </button>
+            <button 
+              class="settings-tab" 
+              :class="{ active: settingsTab === 'ai' }"
+              @click="settingsTab = 'ai'"
+            >
+              🤖 AI
             </button>
           </div>
           
@@ -484,10 +713,147 @@ onUnmounted(() => {
                 </div>
               </div>
             </div>
+            
+            <!-- AI 设置 -->
+            <div v-if="settingsTab === 'ai'" class="settings-section">
+              <h4>AI 大模型配置</h4>
+              <p class="section-desc">配置 AI 模型用于代码审查、提交消息生成、对话助手等功能</p>
+              
+              <div class="config-form">
+                <div class="form-group">
+                  <label>AI 提供商</label>
+                  <select v-model="aiConfig.provider" class="config-select">
+                    <optgroup label="海外服务">
+                      <option value="openai">OpenAI (GPT-4, GPT-4o)</option>
+                      <option value="anthropic">Anthropic (Claude)</option>
+                      <option value="groq">Groq (Llama, Mixtral)</option>
+                    </optgroup>
+                    <optgroup label="国内服务">
+                      <option value="deepseek">DeepSeek (深度求索)</option>
+                      <option value="zhipu">智谱 AI (GLM-4)</option>
+                      <option value="moonshot">Moonshot (Kimi)</option>
+                      <option value="qwen">通义千问 (Qwen)</option>
+                    </optgroup>
+                    <optgroup label="本地模型">
+                      <option value="ollama">Ollama (本地)</option>
+                    </optgroup>
+                  </select>
+                </div>
+                
+                <div class="form-group" v-if="aiConfig.provider !== 'ollama'">
+                  <label>API Key</label>
+                  <input 
+                    v-model="aiConfig.apiKey"
+                    type="password" 
+                    class="config-input"
+                    :placeholder="getApiKeyPlaceholder(aiConfig.provider)"
+                  />
+                  <p class="input-hint">
+                    {{ getApiKeyHint(aiConfig.provider) }}
+                  </p>
+                </div>
+                
+                <div class="form-group">
+                  <label>模型</label>
+                  <select v-model="aiConfig.model" class="config-select">
+                    <option 
+                      v-for="model in availableModels" 
+                      :key="model.value" 
+                      :value="model.value"
+                    >
+                      {{ model.label }} {{ model.desc ? `- ${model.desc}` : '' }}
+                    </option>
+                    <option value="__custom__">✏️ 自定义模型...</option>
+                  </select>
+                  <input 
+                    v-if="aiConfig.model === '__custom__' || !availableModels.some(m => m.value === aiConfig.model)"
+                    v-model="customModelName"
+                    type="text" 
+                    class="config-input"
+                    placeholder="输入自定义模型名称"
+                    style="margin-top: 8px;"
+                    @blur="applyCustomModel"
+                    @keyup.enter="applyCustomModel"
+                  />
+                  <p class="input-hint" v-if="aiConfig.model !== '__custom__'">
+                    当前选择: {{ aiConfig.model }}
+                  </p>
+                </div>
+                
+                <div class="form-group" v-if="aiConfig.provider === 'ollama'">
+                  <label>Ollama 服务地址</label>
+                  <input 
+                    v-model="aiConfig.baseUrl"
+                    type="text" 
+                    class="config-input"
+                    placeholder="http://localhost:11434"
+                  />
+                  <p class="input-hint">本地 Ollama 服务的地址</p>
+                </div>
+                
+                <div class="form-group">
+                  <label>Temperature ({{ aiConfig.temperature }})</label>
+                  <input 
+                    v-model.number="aiConfig.temperature"
+                    type="range" 
+                    class="config-range"
+                    min="0"
+                    max="1"
+                    step="0.1"
+                  />
+                  <p class="input-hint">控制回复的创造性，0 = 保守，1 = 创造性</p>
+                </div>
+                
+                <div class="token-status" :class="{ configured: aiConfig.apiKey || aiConfig.provider === 'ollama' }">
+                  <span v-if="aiConnectionStatus === 'success'" class="status-indicator success">
+                    ✅ 连接成功
+                  </span>
+                  <span v-else-if="aiConnectionStatus === 'error'" class="status-indicator error">
+                    ❌ 连接失败
+                  </span>
+                  <span v-else-if="aiConfig.apiKey || aiConfig.provider === 'ollama'" class="status-indicator success">
+                    ✅ 已配置
+                  </span>
+                  <span v-else class="status-indicator warning">
+                    ⚠️ 未配置 API Key
+                  </span>
+                </div>
+                
+                <div class="form-actions">
+                  <button 
+                    class="test-btn" 
+                    @click="testAIConnection"
+                    :disabled="aiTestingConnection || (!aiConfig.apiKey && aiConfig.provider !== 'ollama')"
+                  >
+                    {{ aiTestingConnection ? '测试中...' : '🔗 测试连接' }}
+                  </button>
+                  <button 
+                    class="save-config-btn" 
+                    @click="saveAIConfig"
+                  >
+                    保存配置
+                  </button>
+                </div>
+              </div>
+              
+              <div class="ai-shortcuts-info">
+                <h5>快捷键</h5>
+                <div class="shortcut-item">
+                  <kbd>⌘</kbd> + <kbd>K</kbd>
+                  <span>打开 AI 助手对话</span>
+                </div>
+              </div>
+            </div>
           </div>
         </aside>
       </div>
     </Transition>
+    
+    <!-- AI 聊天窗口 -->
+    <AIChatWindow 
+      :visible="showAIChat"
+      @close="showAIChat = false"
+    />
   </div>
 </template>
 
@@ -580,8 +946,9 @@ onUnmounted(() => {
 .spotlight-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(8px);
+  background: var(--overlay-bg);
+  backdrop-filter: var(--overlay-blur, blur(8px));
+  -webkit-backdrop-filter: var(--overlay-blur, blur(8px));
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -589,15 +956,50 @@ onUnmounted(() => {
   z-index: 2000;
 }
 
+/* Screenshot FAB: stack above ThemeSwitcher */
+.screenshot-fab {
+  position: fixed;
+  /* place next to ThemeSwitcher (ThemeSwitcher is fixed at bottom:24px; left:20px; width:56px) */
+  bottom: 24px;
+  left: 84px;
+  z-index: 1000;
+  width: 44px;
+  height: 28px;
+  border-radius: 14px;
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+}
+
+.screenshot-fab:hover:not(:disabled) {
+  background: var(--glass-bg-hover);
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.screenshot-fab:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.screenshot-icon {
+  width: 16px;
+  height: 16px;
+}
+
 .spotlight-modal {
   width: 560px;
-  background: rgba(20, 25, 40, 0.95);
-  backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  max-width: calc(100vw - 32px);
+  background: var(--modal-bg);
+  border: 1px solid var(--modal-border);
   border-radius: 16px;
-  box-shadow: 
-    0 24px 48px rgba(0, 0, 0, 0.4),
-    0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.32);
   overflow: hidden;
 }
 
@@ -606,12 +1008,12 @@ onUnmounted(() => {
   align-items: center;
   gap: 12px;
   padding: 16px 20px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--glass-border);
 }
 
 .spotlight-search-icon {
   font-size: 20px;
-  opacity: 0.6;
+  color: var(--text-tertiary);
 }
 
 .spotlight-input {
@@ -619,22 +1021,23 @@ onUnmounted(() => {
   padding: 8px 0;
   font-size: 16px;
   font-weight: 500;
-  color: rgba(255, 255, 255, 0.95);
+  color: var(--text-primary);
   background: transparent;
   border: none;
   outline: none;
 }
 
 .spotlight-input::placeholder {
-  color: rgba(255, 255, 255, 0.35);
+  color: var(--text-tertiary);
 }
 
 .spotlight-shortcut {
   padding: 4px 8px;
   font-size: 11px;
-  font-family: 'JetBrains Mono', monospace;
-  color: rgba(255, 255, 255, 0.4);
-  background: rgba(255, 255, 255, 0.08);
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
   border-radius: 4px;
 }
 
@@ -642,7 +1045,7 @@ onUnmounted(() => {
   padding: 20px;
   text-align: center;
   font-size: 13px;
-  color: rgba(255, 255, 255, 0.4);
+  color: var(--text-tertiary);
 }
 
 /* 全局设置抽屉 */
@@ -1090,6 +1493,121 @@ onUnmounted(() => {
 
 .status-indicator.warning {
   color: var(--warning);
+}
+
+.status-indicator.error {
+  color: var(--error);
+}
+
+/* AI Settings */
+.config-select {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-gradient-start);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.config-select:focus {
+  border-color: var(--accent-primary);
+}
+
+.config-select optgroup {
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.config-select option {
+  padding: 8px 12px;
+  font-weight: 400;
+  color: var(--text-primary);
+}
+
+.config-range {
+  width: 100%;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--glass-border);
+  border-radius: 3px;
+  outline: none;
+}
+
+.config-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  background: var(--accent-primary);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.config-range::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+}
+
+.test-btn {
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent-secondary);
+  background: transparent;
+  border: 1px solid var(--accent-secondary);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.test-btn:hover:not(:disabled) {
+  background: var(--accent-secondary-glow);
+}
+
+.test-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ai-shortcuts-info {
+  margin-top: 24px;
+  padding: 16px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+}
+
+.ai-shortcuts-info h5 {
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.shortcut-item kbd {
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-primary);
+  background: var(--bg-gradient-start);
+  border: 1px solid var(--glass-border);
+  border-radius: 4px;
 }
 
 @keyframes spin {

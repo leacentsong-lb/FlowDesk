@@ -39,7 +39,7 @@ onMounted(() => {
   // Add some default notes if empty
   if (notes.value.length === 0) {
     notes.value = [
-      { id: 1, content: '欢迎使用 Dev Helper! 🎉', createdAt: new Date().toISOString(), color: 'cyan' },
+      { id: 1, content: '欢迎使用 FlowDesk! 🎉', createdAt: new Date().toISOString(), color: 'cyan' },
       { id: 2, content: '点击 + 添加新笔记', createdAt: new Date().toISOString(), color: 'emerald' },
     ]
   }
