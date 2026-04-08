@@ -251,37 +251,18 @@ export const getVueAppApi = (broker, env) =>
 // 主题配置
 // ============================================
 export const THEME_STORAGE_KEY = 'dev_helper_theme'
-
-export const THEMES = [
-  {
-    id: 'cyber-night',
-    name: '赛博之夜',
-    nameEn: 'Cyber Night',
-    icon: '🌙',
-    description: '深色科技风格，霓虹蓝主色调'
-  },
-  {
-    id: 'lemon-fresh',
-    name: '柠檬清新',
-    nameEn: 'Lemon Fresh',
-    icon: '🍋',
-    description: '清爽亮色风格，柠檬绿主色调'
-  }
-]
+export const DEFAULT_THEME = 'lemon-fresh'
 
 // 获取当前主题
-export const getCurrentTheme = () => {
-  return localStorage.getItem(THEME_STORAGE_KEY) || 'cyber-night'
-}
+export const getCurrentTheme = () => DEFAULT_THEME
 
 // 设置主题
-export const setTheme = (themeId) => {
-  localStorage.setItem(THEME_STORAGE_KEY, themeId)
-  document.documentElement.setAttribute('data-theme', themeId)
+export const setTheme = () => {
+  localStorage.setItem(THEME_STORAGE_KEY, DEFAULT_THEME)
+  document.documentElement.setAttribute('data-theme', DEFAULT_THEME)
 }
 
 // 初始化主题（在应用启动时调用）
 export const initTheme = () => {
-  const savedTheme = getCurrentTheme()
-  document.documentElement.setAttribute('data-theme', savedTheme)
+  setTheme()
 }

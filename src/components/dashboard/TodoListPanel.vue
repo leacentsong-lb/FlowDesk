@@ -1,12 +1,16 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { useJiraStore } from '../../stores/jira'
+import { useGithubStore } from '../../stores/github'
+
+const jira = useJiraStore()
+const github = useGithubStore()
 
 // =========================
 // Storage (personal todos)
 // =========================
-const TODOS_STORAGE_KEY = 'dev-helper-todos'
-
+const TODOS_STORAGE_KEY = 'flow-desk-todos'
 const myTodos = ref([])
 const newTodo = ref({ title: '', description: '' })
 const adding = ref(false)
@@ -23,7 +27,7 @@ const loadMyTodos = () => {
 const saveMyTodos = () => {
   try {
     localStorage.setItem(TODOS_STORAGE_KEY, JSON.stringify(myTodos.value))
-  } catch {}
+  } catch { /* ignore */ }
 }
 
 const addMyTodo = () => {
@@ -66,272 +70,22 @@ const formatTime = (dateStr) => {
   return date.toLocaleDateString('zh-CN')
 }
 
-// =========================
-// PR todos (read-only)
-// =========================
-const githubToken = ref(localStorage.getItem('github_token') || '')
-const brokerPaths = ref(JSON.parse(localStorage.getItem('broker_project_paths') || '{}'))
-const me = ref('')
-
-const prTodos = ref([])
-const prLoading = ref(false)
-const prError = ref('')
-
-const normalize = (s) => (s || '').toString().trim().toLowerCase()
-
-const fetchCurrentUser = async () => {
-  if (!githubToken.value) return ''
-  try {
-    const result = await invoke('github_get_current_user', { token: githubToken.value })
-    if (result.status === 200) {
-      const user = JSON.parse(result.body || '{}')
-      return user.login || ''
-    }
-  } catch {}
-  return ''
-}
-
-const parseOwnerRepo = (remoteInfo) => {
-  const normalized = (remoteInfo || '').trim().replace(/\.git$/i, '')
-  const parts = normalized.split('/').filter(Boolean)
-  if (parts.length < 2) return null
-  return { owner: parts[0], repo: parts[1] }
-}
-
-const mapPrToTodo = (owner, repo, pr) => {
-  const number = pr.number
-  const title = pr.title || ''
-  const base = pr.base?.ref || ''
-  const head = pr.head?.ref || ''
-  const updatedAt = pr.updated_at || pr.created_at || ''
-  const url = pr.html_url || ''
-  return {
-    id: `${owner}/${repo}#${number}`,
-    title: `[#${number}] ${title}`,
-    description: `${owner}/${repo}: ${base} ← ${head} · 更新于 ${formatTime(updatedAt)}`,
-    url
-  }
-}
-
-const fetchPrTodos = async () => {
-  prLoading.value = true
-  prError.value = ''
-  prTodos.value = []
-
-  if (!githubToken.value) {
-    prLoading.value = false
-    prError.value = '请先在设置中配置 GitHub Token'
-    return
-  }
-
-  try {
-    if (!me.value) {
-      me.value = await fetchCurrentUser()
-    }
-    const myLogin = normalize(me.value)
-    if (!myLogin) {
-      prError.value = '无法获取当前 GitHub 用户信息'
-      prLoading.value = false
-      return
-    }
-
-    const entries = Object.entries(brokerPaths.value || {})
-    if (entries.length === 0) {
-      prLoading.value = false
-      prError.value = '未配置项目仓库（请在设置中配置 broker paths）'
-      return
-    }
-
-    // limited concurrency
-    const CONCURRENCY = 4
-    let idx = 0
-    const collected = []
-
-    const worker = async () => {
-      while (idx < entries.length) {
-        const cur = entries[idx++]
-        if (!cur) return
-        const [, path] = cur
-        try {
-          const remoteInfo = await invoke('git_get_remote_info', { projectPath: path }).catch(() => '')
-          const parsed = parseOwnerRepo(remoteInfo)
-          if (!parsed) continue
-          const { owner, repo } = parsed
-
-          const res = await invoke('github_list_open_prs', { owner, repo, token: githubToken.value })
-          if (res.status !== 200) continue
-          const prs = JSON.parse(res.body || '[]') || []
-
-          const relevant = prs.filter(pr => {
-            const author = normalize(pr.user?.login)
-            if (author === myLogin) return true
-            const reviewers = (pr.requested_reviewers || []).map(r => normalize(r.login))
-            return reviewers.includes(myLogin)
-          })
-
-          relevant.forEach(pr => collected.push(mapPrToTodo(owner, repo, pr)))
-        } catch {
-          // ignore a single repo failure
-        }
-      }
-    }
-
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, entries.length) }, () => worker()))
-
-    // stable-ish: keep newest first by parsing time out of description is hard; keep as collected order
-    prTodos.value = collected
-  } catch (e) {
-    prError.value = `获取 PR 待办失败: ${e?.message || e}`
-  } finally {
-    prLoading.value = false
-  }
-}
-
 const openUrl = (url) => {
   if (!url) return
   invoke('open_url_raw', { url })
 }
 
-// =========================
-// Jira reminders (read-only)
-// =========================
-const jiraTodos = ref([])
-const jiraLoading = ref(false)
-const jiraError = ref('')
-
-const jiraConfig = ref({
-  domain: localStorage.getItem('jira_domain') || 'thebidgroup.atlassian.net',
-  email: localStorage.getItem('jira_email') || '',
-  apiToken: localStorage.getItem('jira_token') || '',
-  project: localStorage.getItem('jira_project') || ''
-})
-
-const isJiraConfigured = computed(() => !!jiraConfig.value.email && !!jiraConfig.value.apiToken && !!jiraConfig.value.domain)
-
-const isDoneStatus = (status) => {
-  const s = normalize(status)
-  return s.includes('done') || s.includes('完成') || s.includes('closed') || s.includes('resolved')
-}
-
-const getDeadlineStatusText = (dueDate) => {
-  if (!dueDate) return ''
-  const now = new Date()
-  const due = new Date(dueDate)
-  const diffMs = due - now
-  const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24))
-  if (diffDays < 0) return `已逾期 ${Math.abs(diffDays)} 天`
-  if (diffDays === 0) return '今天截止'
-  return `剩余 ${diffDays} 天`
-}
-
-const isDueSoonOrOverdue = (dueDate) => {
-  if (!dueDate) return false
-  const now = new Date()
-  const due = new Date(dueDate)
-  const diffMs = due - now
-  const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24))
-  return diffDays <= 3 // includes overdue (negative)
-}
-
-const fetchJiraTodos = async () => {
-  jiraLoading.value = true
-  jiraError.value = ''
-  jiraTodos.value = []
-
-  if (!isJiraConfigured.value) {
-    jiraLoading.value = false
-    jiraError.value = '请先在设置中配置 Jira（邮箱 + Token）'
-    return
-  }
-
-  try {
-    const result = await invoke('jira_get_my_issues', {
-      domain: jiraConfig.value.domain,
-      email: jiraConfig.value.email,
-      apiToken: jiraConfig.value.apiToken,
-      project: jiraConfig.value.project
-    })
-
-    if (result.status !== 200) {
-      jiraError.value = `获取 Jira 失败: HTTP ${result.status}`
-      jiraLoading.value = false
-      return
-    }
-
-    const data = JSON.parse(result.body || '{}')
-    const issues = (data.issues || []).map(issue => {
-      const fields = issue.fields || {}
-      
-      // 尝试获取"开发预计交付时间"自定义字段
-      let devDueDate = null
-      for (const key of Object.keys(fields)) {
-        if (key.startsWith('customfield_') && fields[key]) {
-          const val = fields[key]
-          // 如果是日期格式字符串 (YYYY-MM-DD)
-          if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) {
-            if (!devDueDate) devDueDate = val
-          }
-        }
-      }
-      // 尝试常见的自定义字段名
-      const specificDevDue = fields.customfield_10015 || fields.customfield_10016 || 
-                             fields.customfield_10036 || fields.customfield_10037
-      if (specificDevDue && typeof specificDevDue === 'string') {
-        devDueDate = specificDevDue
-      }
-      
-      return {
-        key: issue.key,
-        summary: fields.summary || '',
-        status: fields.status?.name || '',
-        type: fields.issuetype?.name || '',
-        dueDate: fields.duedate || null,
-        devDueDate: devDueDate
-      }
-    })
-
-    // 收集提醒：优先使用开发预计交付时间，其次使用原生截止日期
-    const reminders = issues
-      .filter(i => {
-        const effectiveDate = i.devDueDate || i.dueDate
-        return effectiveDate && isDueSoonOrOverdue(effectiveDate)
-      })
-      .filter(i => !isDoneStatus(i.status))
-      .map(i => {
-        const effectiveDate = i.devDueDate || i.dueDate
-        const isDevDue = !!i.devDueDate
-        return {
-          id: `jira-${i.key}`,
-          title: `${i.key} ${i.summary}`,
-          description: `${i.status} · ${isDevDue ? '开发交付' : '截止'}${getDeadlineStatusText(effectiveDate)}`,
-          url: `https://${jiraConfig.value.domain}/browse/${i.key}`
-        }
-      })
-
-    jiraTodos.value = reminders
-  } catch (e) {
-    jiraError.value = `获取 Jira 提醒失败: ${e?.message || e}`
-  } finally {
-    jiraLoading.value = false
-  }
-}
-
 const refreshAll = async () => {
-  githubToken.value = localStorage.getItem('github_token') || ''
-  brokerPaths.value = JSON.parse(localStorage.getItem('broker_project_paths') || '{}')
-  jiraConfig.value = {
-    domain: localStorage.getItem('jira_domain') || 'thebidgroup.atlassian.net',
-    email: localStorage.getItem('jira_email') || '',
-    apiToken: localStorage.getItem('jira_token') || '',
-    project: localStorage.getItem('jira_project') || ''
+  github.reset()
+  const tasks = [github.fetchPrTodos()]
+  if (jira.isConfigured && jira.issues.length === 0) {
+    tasks.push(jira.fetchIssues())
   }
-  me.value = ''
-  await Promise.all([fetchPrTodos(), fetchJiraTodos()])
+  await Promise.all(tasks)
 }
 
 onMounted(async () => {
   loadMyTodos()
-  // seed default my todos if empty (simple, non-sensitive)
   if (myTodos.value.length === 0) {
     myTodos.value = [
       { id: Date.now(), title: '整理今天的优先级', description: '先看 Jira 截止提醒 + PR 待办', done: false, createdAt: new Date().toISOString() }
@@ -350,7 +104,7 @@ onMounted(async () => {
         <span>Todo</span>
       </div>
       <div class="panel-actions">
-        <button class="panel-action" title="刷新 PR / Jira" @click="refreshAll" :disabled="prLoading || jiraLoading">🔄</button>
+        <button class="panel-action" title="刷新 PR / Jira" @click="refreshAll" :disabled="github.prLoading || jira.loading">🔄</button>
         <button class="panel-action add-btn" :title="adding ? '取消' : '新增 todo'" @click="adding = !adding">{{ adding ? '✕' : '＋' }}</button>
       </div>
     </div>
@@ -370,13 +124,13 @@ onMounted(async () => {
       <div class="section">
         <div class="section-header">
           <span class="section-title">PR 待办</span>
-          <span v-if="prLoading" class="mini-muted">加载中...</span>
-          <span v-else class="mini-muted">{{ prTodos.length }} 项</span>
+          <span v-if="github.prLoading" class="mini-muted">加载中...</span>
+          <span v-else class="mini-muted">{{ github.prTodos.length }} 项</span>
         </div>
-        <div v-if="prError" class="inline-error">{{ prError }}</div>
-        <div v-else-if="!prLoading && prTodos.length === 0" class="empty-row">暂无相关 PR</div>
+        <div v-if="github.prError" class="inline-error">{{ github.prError }}</div>
+        <div v-else-if="!github.prLoading && github.prTodos.length === 0" class="empty-row">暂无相关 PR</div>
         <div v-else class="todo-list">
-          <div v-for="t in prTodos" :key="t.id" class="todo-item readonly">
+          <div v-for="t in github.prTodos" :key="t.id" class="todo-item readonly">
             <div class="todo-main">
               <button class="todo-title link" @click="openUrl(t.url)">{{ t.title }}</button>
               <div class="todo-desc">{{ t.description }}</div>
@@ -386,19 +140,25 @@ onMounted(async () => {
       </div>
 
       <!-- Jira reminders -->
-      <div class="section">
+      <div class="section jira-section" :class="{ 'has-urgent': jira.upcomingDeadlines.some(t => t.urgency === 'overdue' || t.urgency === 'today') }">
         <div class="section-header">
-          <span class="section-title">Jira 提醒</span>
-          <span v-if="jiraLoading" class="mini-muted">加载中...</span>
-          <span v-else class="mini-muted">{{ jiraTodos.length }} 项</span>
+          <span class="section-title">
+            <span v-if="jira.upcomingDeadlines.some(t => t.urgency === 'overdue')" class="alert-icon pulse">🚨</span>
+            <span v-else-if="jira.upcomingDeadlines.some(t => t.urgency === 'today')" class="alert-icon">⚠️</span>
+            Jira 提醒
+          </span>
+          <span v-if="jira.loading" class="mini-muted">加载中...</span>
+          <span v-else-if="jira.upcomingDeadlines.length > 0" class="urgency-badge" :class="jira.upcomingDeadlines[0]?.urgency">{{ jira.upcomingDeadlines.length }} 项</span>
+          <span v-else class="mini-muted">{{ jira.upcomingDeadlines.length }} 项</span>
         </div>
-        <div v-if="jiraError" class="inline-error">{{ jiraError }}</div>
-        <div v-else-if="!jiraLoading && jiraTodos.length === 0" class="empty-row">暂无 3 天内截止/逾期任务</div>
+        <div v-if="jira.error" class="inline-error">{{ jira.error }}</div>
+        <div v-else-if="!jira.loading && jira.upcomingDeadlines.length === 0" class="empty-row">暂无 3 天内截止/逾期任务</div>
         <div v-else class="todo-list">
-          <div v-for="t in jiraTodos" :key="t.id" class="todo-item warning readonly">
+          <div v-for="t in jira.upcomingDeadlines" :key="t.id" class="todo-item readonly" :class="['urgency-' + t.urgency]">
+            <div class="urgency-indicator" :class="t.urgency"></div>
             <div class="todo-main">
-              <button class="todo-title link" @click="openUrl(t.url)">{{ t.title }}</button>
-              <div class="todo-desc">{{ t.description }}</div>
+              <button class="todo-title link" :class="t.urgency" @click="openUrl(t.url)">{{ t.title }}</button>
+              <div class="todo-desc" :class="t.urgency">{{ t.description }}</div>
             </div>
           </div>
         </div>
@@ -429,7 +189,7 @@ onMounted(async () => {
     </div>
 
     <div class="panel-footer">
-      <span class="footer-text">PR {{ prTodos.length }} · Jira {{ jiraTodos.length }} · 我的 {{ myTodos.length }}</span>
+      <span class="footer-text">PR {{ github.prTodos.length }} · Jira {{ jira.upcomingDeadlines.length }} · 我的 {{ myTodos.length }}</span>
       <span class="footer-hint">本地存储</span>
     </div>
   </div>
@@ -628,19 +388,135 @@ onMounted(async () => {
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
   border-radius: 12px;
+  position: relative;
+  overflow: hidden;
+  transition: all 0.2s ease;
 }
 
-.todo-item.warning {
-  border-color: rgba(249, 115, 22, 0.35);
-  background: rgba(249, 115, 22, 0.08);
+/* 紧急程度指示条 */
+.urgency-indicator {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: 12px 0 0 12px;
+}
+
+.urgency-indicator.overdue {
+  background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.6);
+}
+
+.urgency-indicator.today {
+  background: linear-gradient(180deg, #f97316 0%, #ea580c 100%);
+  box-shadow: 0 0 10px rgba(249, 115, 22, 0.5);
+}
+
+.urgency-indicator.urgent {
+  background: linear-gradient(180deg, #fb923c 0%, #f97316 100%);
+  box-shadow: 0 0 8px rgba(251, 146, 60, 0.4);
+}
+
+.urgency-indicator.warning {
+  background: linear-gradient(180deg, #fbbf24 0%, #f59e0b 100%);
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.35);
+}
+
+/* 已逾期 - 红色危险样式 */
+.todo-item.urgency-overdue {
+  border-color: rgba(239, 68, 68, 0.5);
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.15) 0%, rgba(220, 38, 38, 0.08) 100%);
+  animation: urgentPulse 2s ease-in-out infinite;
+}
+
+/* 今天截止 - 红橙色紧急样式 */
+.todo-item.urgency-today {
+  border-color: rgba(249, 115, 22, 0.5);
+  background: linear-gradient(135deg, rgba(249, 115, 22, 0.14) 0%, rgba(234, 88, 12, 0.08) 100%);
+  animation: urgentPulse 3s ease-in-out infinite;
+}
+
+/* 明天截止 - 橙色紧急样式 */
+.todo-item.urgency-urgent {
+  border-color: rgba(251, 146, 60, 0.45);
+  background: linear-gradient(135deg, rgba(251, 146, 60, 0.12) 0%, rgba(249, 115, 22, 0.06) 100%);
+}
+
+/* 3天内 - 黄橙色警告样式 */
+.todo-item.urgency-warning {
+  border-color: rgba(251, 191, 36, 0.4);
+  background: linear-gradient(135deg, rgba(251, 191, 36, 0.1) 0%, rgba(245, 158, 11, 0.05) 100%);
+}
+
+@keyframes urgentPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+  }
+  50% {
+    box-shadow: 0 0 12px 2px rgba(239, 68, 68, 0.25);
+  }
 }
 
 .todo-item.readonly {
-  padding-left: 14px;
+  padding-left: 18px;
 }
 
 .todo-item.done {
   opacity: 0.7;
+}
+
+/* Jira section 样式 */
+.jira-section.has-urgent .section-title {
+  color: #ef4444;
+  font-weight: 800;
+}
+
+.alert-icon {
+  margin-right: 4px;
+}
+
+.alert-icon.pulse {
+  animation: iconPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes iconPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.7; transform: scale(1.1); }
+}
+
+/* 紧急程度徽章 */
+.urgency-badge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.urgency-badge.overdue {
+  color: #fff;
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+  animation: badgePulse 2s ease-in-out infinite;
+}
+
+.urgency-badge.today {
+  color: #fff;
+  background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
+}
+
+.urgency-badge.urgent {
+  color: #fff;
+  background: linear-gradient(135deg, #fb923c 0%, #f97316 100%);
+}
+
+.urgency-badge.warning {
+  color: #92400e;
+  background: linear-gradient(135deg, #fde047 0%, #fbbf24 100%);
+}
+
+@keyframes badgePulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+  50% { box-shadow: 0 0 8px 2px rgba(239, 68, 68, 0.4); }
 }
 
 .todo-main {
@@ -670,6 +546,26 @@ onMounted(async () => {
 
 .todo-title.link:hover { text-decoration: underline; }
 
+/* 紧急程度链接颜色 */
+.todo-title.link.overdue {
+  color: #dc2626;
+  font-weight: 800;
+}
+
+.todo-title.link.today {
+  color: #ea580c;
+  font-weight: 700;
+}
+
+.todo-title.link.urgent {
+  color: #d97706;
+  font-weight: 600;
+}
+
+.todo-title.link.warning {
+  color: #b45309;
+}
+
 .todo-desc {
   margin-top: 4px;
   font-size: 12px;
@@ -679,6 +575,25 @@ onMounted(async () => {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* 紧急程度描述颜色 */
+.todo-desc.overdue {
+  color: #ef4444;
+  font-weight: 600;
+}
+
+.todo-desc.today {
+  color: #f97316;
+  font-weight: 500;
+}
+
+.todo-desc.urgent {
+  color: #fb923c;
+}
+
+.todo-desc.warning {
+  color: #fbbf24;
 }
 
 .todo-meta {

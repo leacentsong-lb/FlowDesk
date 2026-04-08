@@ -4,6 +4,9 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig({
   plugins: [vue()],
   clearScreen: false,
+  test: {
+    environment: 'jsdom'
+  },
   server: {
     port: 1420,
     strictPort: true,

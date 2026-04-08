@@ -1,242 +1,52 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { useJiraStore } from '../../stores/jira'
 
-const emit = defineEmits(['createBranch'])
+const emitEvent = defineEmits(['createBranch'])
+const jira = useJiraStore()
 
-// Jira 配置
-const jiraConfig = ref({
-  domain: localStorage.getItem('jira_domain') || 'thebidgroup.atlassian.net',
-  email: localStorage.getItem('jira_email') || '',
-  apiToken: localStorage.getItem('jira_token') || '',
-  project: localStorage.getItem('jira_project') || 'CRMCN',
-  // Teams 提测 Webhook URL（用于 Story 提测通知）
-  powerAutomateWebhook: localStorage.getItem('jira_power_automate_webhook') || ''
-})
-
-// 状态
-const loading = ref(false)
-const testingConnection = ref(false)
-const connectionStatus = ref('') // 'success', 'error', ''
-const error = ref('')
-const issues = ref([])
 const showConfig = ref(false)
+const testingConnection = ref(false)
+const connectionStatus = ref('')
 
-// 状态筛选（默认选中"进行中"）
-const activeFilter = ref('in_progress')
-const filters = [
-  { id: 'all', label: '全部' },
-  { id: 'in_progress', label: '进行中' },
-  { id: 'todo', label: '待办' },
-  { id: 'done', label: '已完成' }
+const activeTab = ref('task')
+const tabs = [
+  { id: 'bug', label: 'Bug' },
+  { id: 'task', label: 'Task' }
 ]
 
-// 按状态分组 (In Dev 和 In Progress 合并为"进行中")
-const groupedIssues = computed(() => {
-  const groups = {
-    in_progress: [],
-    todo: [],
-    done: [],
-    other: []
-  }
-  
-  issues.value.forEach(issue => {
-    const statusName = issue.status?.toLowerCase() || ''
-    // In Dev, In Progress, 进行中 都归为进行中
-    if (statusName.includes('progress') || statusName.includes('进行') || statusName.includes('dev') || statusName.includes('review')) {
-      groups.in_progress.push(issue)
-    } else if (statusName.includes('to do') || statusName.includes('待办') || statusName.includes('open') || statusName.includes('backlog')) {
-      groups.todo.push(issue)
-    } else if (statusName.includes('done') || statusName.includes('完成') || statusName.includes('closed') || statusName.includes('resolved')) {
-      groups.done.push(issue)
-    } else {
-      groups.other.push(issue)
-    }
-  })
-  
-  return groups
+const displayIssues = computed(() => {
+  return jira.groupedByType[activeTab.value] || []
 })
 
-// 筛选后的任务
-const filteredIssues = computed(() => {
-  if (activeFilter.value === 'all') {
-    return issues.value
-  }
-  return groupedIssues.value[activeFilter.value] || []
-})
-
-// 统计
-const stats = computed(() => ({
-  total: issues.value.length,
-  inProgress: groupedIssues.value.in_progress.length,
-  todo: groupedIssues.value.todo.length,
-  done: groupedIssues.value.done.length
-}))
-
-// 是否已配置
-const isConfigured = computed(() => {
-  return jiraConfig.value.email && jiraConfig.value.apiToken
-})
-
-// 测试连接
 const testConnection = async () => {
   testingConnection.value = true
   connectionStatus.value = ''
-  error.value = ''
-  
-  try {
-    const result = await invoke('jira_get_projects', {
-      domain: jiraConfig.value.domain,
-      email: jiraConfig.value.email,
-      apiToken: jiraConfig.value.apiToken
-    })
-    
-    if (result.status === 200) {
-      connectionStatus.value = 'success'
-    } else if (result.status === 401) {
-      connectionStatus.value = 'error'
-      error.value = '认证失败，请检查邮箱和 API Token'
-    } else {
-      connectionStatus.value = 'error'
-      error.value = `连接失败: HTTP ${result.status} - ${result.body}`
-    }
-  } catch (e) {
-    connectionStatus.value = 'error'
-    error.value = `连接失败: ${e.message || e}`
-  } finally {
-    testingConnection.value = false
-  }
+  const result = await jira.testProjectConnection()
+  connectionStatus.value = result.success ? 'success' : 'error'
+  if (!result.success) jira.error = result.error || '连接失败'
+  testingConnection.value = false
 }
 
-// 获取任务
-const fetchIssues = async () => {
-  if (!isConfigured.value) {
-    showConfig.value = true
-    return
-  }
-  
-  loading.value = true
-  error.value = ''
-  
-  try {
-    const result = await invoke('jira_get_my_issues', {
-      domain: jiraConfig.value.domain,
-      email: jiraConfig.value.email,
-      apiToken: jiraConfig.value.apiToken,
-      project: jiraConfig.value.project
-    })
-    
-    if (result.status === 200) {
-      const data = JSON.parse(result.body)
-      issues.value = (data.issues || []).map(issue => {
-        const fields = issue.fields || {}
-        
-        // 尝试获取"开发预计交付时间"自定义字段
-        // 常见的自定义字段名称可能是 customfield_10015, customfield_10016 等
-        // 遍历所有 customfield_ 开头的字段，查找包含日期的字段
-        let devDueDate = null
-        for (const key of Object.keys(fields)) {
-          if (key.startsWith('customfield_') && fields[key]) {
-            const val = fields[key]
-            // 如果是日期格式字符串 (YYYY-MM-DD)
-            if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}/.test(val)) {
-              // 可能是开发预计交付时间，保存第一个找到的
-              if (!devDueDate) devDueDate = val
-            }
-          }
-        }
-        
-        // 优先使用特定的字段名（如果知道的话）
-        // customfield_10015 是常见的 "Dev Due Date" 字段
-        const specificDevDue = fields.customfield_10015 || fields.customfield_10016 || 
-                               fields.customfield_10036 || fields.customfield_10037
-        if (specificDevDue && typeof specificDevDue === 'string') {
-          devDueDate = specificDevDue
-        }
-        
-        return {
-          id: issue.id,
-          key: issue.key,
-          summary: fields.summary || '',
-          status: fields.status?.name || 'Unknown',
-          statusCategory: fields.status?.statusCategory?.key || '',
-          type: fields.issuetype?.name || 'Task',
-          typeIcon: fields.issuetype?.iconUrl || '',
-          priority: fields.priority?.name || 'Medium',
-          priorityIcon: fields.priority?.iconUrl || '',
-          project: fields.project?.key || '',
-          projectName: fields.project?.name || '',
-          created: fields.created,
-          updated: fields.updated,
-          // 截止日期 (Jira 原生 due date)
-          dueDate: fields.duedate || null,
-          // 开发预计交付时间 (自定义字段)
-          devDueDate: devDueDate,
-          // 父任务/Epic 信息
-          parent: fields.parent ? {
-            key: fields.parent.key,
-            summary: fields.parent.fields?.summary || '',
-            type: fields.parent.fields?.issuetype?.name || ''
-          } : null,
-          // 负责人信息
-          assignee: fields.assignee ? {
-            displayName: fields.assignee.displayName,
-            email: fields.assignee.emailAddress,
-            avatarUrl: fields.assignee.avatarUrls?.['48x48']
-          } : null,
-          // 任务链接
-          url: `https://${jiraConfig.value.domain}/browse/${issue.key}`
-        }
-      })
-    } else if (result.status === 401) {
-      error.value = '认证失败，请检查邮箱和 API Token'
-      showConfig.value = true
-    } else {
-      error.value = `获取失败: HTTP ${result.status} - ${result.body}`
-    }
-  } catch (e) {
-    error.value = `请求失败: ${e.message || e}`
-  } finally {
-    loading.value = false
-  }
-}
-
-// 打开全局设置
 const openGlobalSettings = () => {
   showConfig.value = false
-  // 触发全局事件打开设置抽屉，并切换到 Jira 标签
   window.dispatchEvent(new CustomEvent('open-settings', { detail: { tab: 'jira' } }))
 }
 
-// 保存配置 (保留兼容性，但主要使用全局设置)
-const saveConfig = () => {
-  localStorage.setItem('jira_domain', jiraConfig.value.domain)
-  localStorage.setItem('jira_email', jiraConfig.value.email)
-  localStorage.setItem('jira_token', jiraConfig.value.apiToken)
-  localStorage.setItem('jira_project', jiraConfig.value.project)
-  localStorage.setItem('jira_power_automate_webhook', jiraConfig.value.powerAutomateWebhook)
-  showConfig.value = false
-  connectionStatus.value = ''
-  fetchIssues()
-}
-
-// 取消配置
 const cancelConfig = () => {
   showConfig.value = false
   connectionStatus.value = ''
-  jiraConfig.value.email = localStorage.getItem('jira_email') || ''
-  jiraConfig.value.apiToken = localStorage.getItem('jira_token') || ''
-  jiraConfig.value.project = localStorage.getItem('jira_project') || 'CRMCN'
-  jiraConfig.value.powerAutomateWebhook = localStorage.getItem('jira_power_automate_webhook') || ''
 }
 
-// 单独保存 Webhook 配置
-const saveWebhookConfig = () => {
-  localStorage.setItem('jira_power_automate_webhook', jiraConfig.value.powerAutomateWebhook)
-  alert('✅ Webhook URL 已保存')
+const fetchIssues = () => {
+  if (!jira.isConfigured) {
+    showConfig.value = true
+    return
+  }
+  jira.fetchIssues()
 }
 
-// 获取类型配置 (图标 + 颜色)
 const getTypeConfig = (type) => {
   const configs = {
     'Bug': { icon: '🐛', color: '#f43f5e', bg: 'rgba(244, 63, 94, 0.15)', label: 'Bug' },
@@ -315,9 +125,8 @@ const isBug = (issue) => {
   return issue.type?.toLowerCase() === 'bug'
 }
 
-// 创建分支
 const handleCreateBranch = (issue) => {
-  emit('createBranch', {
+  emitEvent('createBranch', {
     key: issue.key,
     summary: issue.summary,
     type: issue.type
@@ -329,10 +138,12 @@ const isStory = (issue) => {
   return issue.type === 'Story'
 }
 
-// 触发提测通知状态
+const getHierarchyText = (issue) => {
+  return issue.hierarchyText || issue.key
+}
+
 const triggeringWebhook = ref(new Set())
 
-// 提测弹窗状态
 const showTestModal = ref(false)
 const currentTestIssue = ref(null)
 const testFormData = ref({
@@ -344,7 +155,6 @@ const testFormData = ref({
   assignee: ''
 })
 
-// 打开提测编辑弹窗
 const openTestModal = (issue) => {
   currentTestIssue.value = issue
   testFormData.value = {
@@ -358,17 +168,15 @@ const openTestModal = (issue) => {
   showTestModal.value = true
 }
 
-// 关闭提测弹窗
 const closeTestModal = () => {
   showTestModal.value = false
   currentTestIssue.value = null
 }
 
-// 发送提测通知到 Teams
 const sendTestNotification = async () => {
   const issue = currentTestIssue.value
-  const webhookUrl = jiraConfig.value.powerAutomateWebhook
-  
+  const webhookUrl = jira.config.teamsWebhook
+
   if (!webhookUrl) {
     alert('⚠️ 请先配置 Teams Webhook URL')
     return
@@ -402,78 +210,46 @@ const sendTestNotification = async () => {
     }
   } catch (e) {
     console.error('提测通知发送失败:', e)
-    error.value = `发送失败: ${e.message || e}`
+    jira.error = `发送失败: ${e.message || e}`
     alert(`❌ 发送失败: ${e.message || e}`)
   } finally {
     triggeringWebhook.value.delete(issue.key)
   }
 }
 
-// 触发提测通知到 Teams（仅 Story 类型且有 Epic）
 const triggerPowerAutomate = (issue) => {
-  // 检查是否有 Epic 信息
   if (!issue.parent || issue.parent.type !== 'Epic') {
     alert('⚠️ 该 Story 没有关联 Epic，无法生成提测消息')
     return
   }
-  
-  const webhookUrl = jiraConfig.value.powerAutomateWebhook
-  if (!webhookUrl) {
+  if (!jira.config.teamsWebhook) {
     alert('⚠️ 请先配置 Teams Webhook URL')
     return
   }
-  
-  // 打开提测编辑弹窗
   openTestModal(issue)
 }
 
-// 打开 Jira 链接
 const openJiraLink = (issue) => {
-  const url = `https://${jiraConfig.value.domain}/browse/${issue.key}`
-  invoke('open_url_raw', { url })
+  invoke('open_url_raw', { url: issue.url || `https://${jira.config.domain}/browse/${issue.key}` })
 }
 
-// 格式化时间
 const formatTime = (dateStr) => {
   if (!dateStr) return ''
   const date = new Date(dateStr)
   const now = new Date()
   const diff = now - date
-  
   if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`
   if (diff < 86400000) return `${Math.floor(diff / 3600000)} 小时前`
   if (diff < 604800000) return `${Math.floor(diff / 86400000)} 天前`
   return date.toLocaleDateString('zh-CN')
 }
 
-// 监听全局 Jira 配置更新
-const handleJiraConfigUpdated = (event) => {
-  const newConfig = event.detail
-  jiraConfig.value = {
-    domain: newConfig.domain || jiraConfig.value.domain,
-    email: newConfig.email || jiraConfig.value.email,
-    apiToken: newConfig.apiToken || jiraConfig.value.apiToken,
-    project: newConfig.project || jiraConfig.value.project
-  }
-  // 配置更新后重新获取任务
-  if (isConfigured.value) {
-    fetchIssues()
-  }
-}
-
 onMounted(() => {
-  // 监听全局配置更新事件
-  window.addEventListener('jira-config-updated', handleJiraConfigUpdated)
-  
-  if (isConfigured.value) {
-    fetchIssues()
+  if (jira.isConfigured) {
+    if (jira.issues.length === 0) jira.fetchIssues()
   } else {
     showConfig.value = true
   }
-})
-
-onUnmounted(() => {
-  window.removeEventListener('jira-config-updated', handleJiraConfigUpdated)
 })
 </script>
 
@@ -483,12 +259,12 @@ onUnmounted(() => {
       <div class="panel-title">
         <span class="panel-icon">📋</span>
         <span>Jira Tasks</span>
-        <span v-if="stats.total" class="task-count">{{ stats.total }}</span>
+        <span v-if="jira.stats.total" class="task-count">{{ jira.stats.total }}</span>
       </div>
       <div class="header-actions">
         <button class="panel-action" title="设置" @click="showConfig = true">⚙️</button>
-        <button class="panel-action" title="刷新" @click="fetchIssues" :disabled="loading">
-          <span :class="{ spinning: loading }">🔄</span>
+        <button class="panel-action" title="刷新" @click="fetchIssues" :disabled="jira.loading">
+          <span :class="{ spinning: jira.loading }">🔄</span>
         </button>
       </div>
     </div>
@@ -499,18 +275,18 @@ onUnmounted(() => {
         <h3>Jira 配置</h3>
         
         <!-- 已配置状态 -->
-        <div v-if="isConfigured" class="config-status configured">
+        <div v-if="jira.isConfigured" class="config-status configured">
           <div class="status-icon">✅</div>
           <div class="status-info">
             <div class="status-title">已配置</div>
             <div class="status-detail">
-              <span class="config-label">域名:</span> {{ jiraConfig.domain }}
+              <span class="config-label">域名:</span> {{ jira.config.domain }}
             </div>
             <div class="status-detail">
-              <span class="config-label">邮箱:</span> {{ jiraConfig.email }}
+              <span class="config-label">邮箱:</span> {{ jira.config.email }}
             </div>
             <div class="status-detail">
-              <span class="config-label">项目:</span> {{ jiraConfig.project || '全部项目' }}
+              <span class="config-label">项目:</span> {{ jira.config.project ? jira.config.project.split('\n').join(', ') : '全部项目' }}
             </div>
           </div>
         </div>
@@ -525,31 +301,10 @@ onUnmounted(() => {
         </div>
         
         <div class="config-hint">
-          <p>💡 Jira 配置已移至全局设置，点击下方按钮前往设置</p>
+          <p>💡 Jira 配置和 Teams Webhook 已移至全局设置</p>
         </div>
         
-        <!-- Teams 提测 Webhook 配置 -->
-        <div class="webhook-config">
-          <label class="webhook-label">
-            🚀 Teams 提测 Webhook
-          </label>
-          <input 
-            type="text" 
-            v-model="jiraConfig.powerAutomateWebhook"
-            placeholder="https://xxx.webhook.office.com/..."
-            class="webhook-input"
-          />
-          <button 
-            class="btn-sm" 
-            @click="saveWebhookConfig"
-            :disabled="!jiraConfig.powerAutomateWebhook"
-          >
-            保存 Webhook
-          </button>
-        </div>
-        
-        <!-- 测试连接 -->
-        <div v-if="isConfigured" class="connection-test">
+        <div v-if="jira.isConfigured" class="connection-test">
           <button 
             class="test-btn" 
             @click="testConnection" 
@@ -563,9 +318,8 @@ onUnmounted(() => {
           <span v-else-if="connectionStatus === 'error'" class="connection-error">❌ 连接失败</span>
         </div>
         
-        <!-- 错误信息 -->
-        <div v-if="error && showConfig" class="config-error">
-          {{ error }}
+        <div v-if="jira.error && showConfig" class="config-error">
+          {{ jira.error }}
         </div>
         
         <div class="config-actions">
@@ -578,37 +332,35 @@ onUnmounted(() => {
     </div>
     
     <div class="panel-content">
-      <!-- 错误提示 -->
-      <div v-if="error" class="error-message">
-        {{ error }}
+      <div v-if="jira.error" class="error-message">
+        {{ jira.error }}
       </div>
       
-      <!-- 筛选器 -->
+      <!-- 标签栏 -->
       <div class="task-filters">
         <button 
-          v-for="f in filters" 
-          :key="f.id"
+          v-for="tab in tabs" 
+          :key="tab.id"
           class="filter-btn" 
-          :class="{ active: activeFilter === f.id }"
-          @click="activeFilter = f.id"
+          :class="{ active: activeTab === tab.id }"
+          @click="activeTab = tab.id"
         >
-          {{ f.label }}
-          <span v-if="f.id === 'in_progress'" class="filter-count">{{ stats.inProgress }}</span>
-          <span v-else-if="f.id === 'todo'" class="filter-count">{{ stats.todo }}</span>
-          <span v-else-if="f.id === 'done'" class="filter-count">{{ stats.done }}</span>
+          {{ tab.label }}
+          <span class="filter-count">
+            {{ tab.id === 'bug' ? jira.typeStats.bug : jira.typeStats.task }}
+          </span>
         </button>
       </div>
       
-      <!-- 加载中 -->
-      <div v-if="loading" class="loading-state">
+      <div v-if="jira.loading" class="loading-state">
         <div class="spinner"></div>
         <span>加载中...</span>
       </div>
       
       <!-- 任务列表 -->
-      <div v-else-if="filteredIssues.length > 0" class="task-list">
+      <div v-else-if="displayIssues.length > 0" class="task-list">
         <div 
-          v-for="issue in filteredIssues" 
+          v-for="issue in displayIssues" 
           :key="issue.id" 
           class="task-card"
           :class="{ 
@@ -617,13 +369,6 @@ onUnmounted(() => {
             'has-parent': issue.parent
           }"
         >
-          <!-- 父任务/Epic 信息 -->
-          <div v-if="issue.parent" class="task-parent">
-            <span class="parent-icon">{{ getTypeIcon(issue.parent.type) }}</span>
-            <span class="parent-key">{{ issue.parent.key }}</span>
-            <span class="parent-summary">{{ issue.parent.summary }}</span>
-          </div>
-          
           <div class="task-header">
             <!-- 类型标签 -->
             <span 
@@ -639,6 +384,7 @@ onUnmounted(() => {
             <span class="task-key" @click="openJiraLink(issue)">{{ issue.key }}</span>
             <span class="task-status" :class="getStatusClass(issue.status)">{{ issue.status }}</span>
           </div>
+          <div class="task-hierarchy" @click="openJiraLink(issue)">{{ getHierarchyText(issue) }}</div>
           <div class="task-title" @click="openJiraLink(issue)">{{ issue.summary }}</div>
           <div class="task-meta">
             <span class="task-project">{{ issue.project }}</span>
@@ -671,9 +417,9 @@ onUnmounted(() => {
             <button 
               class="trigger-webhook-btn" 
               :class="{ 'is-loading': triggeringWebhook.has(issue.key) }"
-              :disabled="triggeringWebhook.has(issue.key) || !jiraConfig.powerAutomateWebhook || !issue.parent || issue.parent.type !== 'Epic'"
+              :disabled="triggeringWebhook.has(issue.key) || !jira.config.teamsWebhook || !issue.parent || issue.parent.type !== 'Epic'"
               @click="triggerPowerAutomate(issue)"
-              :title="!jiraConfig.powerAutomateWebhook ? '请先配置 Webhook URL' : (!issue.parent || issue.parent.type !== 'Epic') ? '该 Story 未关联 Epic，无法提测' : '发送提测通知到 Teams'"
+              :title="!jira.config.teamsWebhook ? '请先配置 Webhook URL' : (!issue.parent || issue.parent.type !== 'Epic') ? '该 Story 未关联 Epic，无法提测' : '发送提测通知到 Teams'"
             >
               <span v-if="triggeringWebhook.has(issue.key)">⏳ 提测中...</span>
               <span v-else>🚀 提测</span>
@@ -682,17 +428,19 @@ onUnmounted(() => {
         </div>
       </div>
       
-      <!-- 空状态 -->
       <div v-else class="empty-state">
         <div class="empty-icon">📋</div>
-        <p v-if="isConfigured">暂无任务</p>
+        <p v-if="jira.isConfigured">暂无任务</p>
         <p v-else>请先配置 Jira 账号</p>
       </div>
     </div>
     
     <div class="panel-footer">
-      <span class="footer-text">{{ jiraConfig.domain }}</span>
-      <span v-if="stats.inProgress" class="progress-badge">{{ stats.inProgress }} 进行中</span>
+      <span class="footer-text">{{ jira.config.domain }}</span>
+      <span v-if="jira.stats.total" class="progress-badge">
+        {{ activeTab === 'task' ? jira.typeStats.task : jira.typeStats.bug }}
+        {{ activeTab === 'task' ? 'Task' : 'Bug' }}
+      </span>
     </div>
   </div>
   

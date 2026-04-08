@@ -1,56 +1,41 @@
 <script setup>
-// defineProps and defineEmits are Vue compiler macros, no import needed
 const props = defineProps({
-  currentView: {
-    type: String,
-    default: 'dashboard'
-  }
+  currentView: { type: String, default: 'dashboard' }
 })
-
-const emit = defineEmits(['navigate', 'openSettings', 'openSpotlight'])
-
-const navItems = [
-  { id: 'dashboard', icon: '🏠', label: 'Home', tooltip: '工作台' },
-  { id: 'dev', icon: '👨‍💻', label: 'Dev', tooltip: '开发面板' }
-]
-
-const handleNavigate = (viewId) => {
-  emit('navigate', viewId)
-}
-
-const handleSettings = () => {
-  emit('openSettings')
-}
-
-const handleSpotlight = () => {
-  emit('openSpotlight')
-}
+const emit = defineEmits(['openSettings', 'navigate'])
 </script>
 
 <template>
   <div class="floating-dock">
     <div class="dock-container">
-      <!-- Navigation Items -->
       <div class="dock-nav">
         <button
-          v-for="item in navItems"
-          :key="item.id"
           class="dock-item"
-          :class="{ active: currentView === item.id }"
-          :title="item.tooltip"
-          @click="handleNavigate(item.id)"
+          :class="{ active: currentView === 'dashboard' }"
+          title="工作台"
+          @click="emit('navigate', 'dashboard')"
         >
-          <span class="dock-icon">{{ item.icon }}</span>
-          <span class="dock-label">{{ item.label }}</span>
+          <svg class="dock-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+          <span class="dock-label">Home</span>
+        </button>
+
+        <button
+          class="dock-item"
+          :class="{ active: currentView === 'dev' }"
+          title="Dev"
+          @click="emit('navigate', 'dev')"
+        >
+          <svg class="dock-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          <span class="dock-label">Dev</span>
         </button>
         
         <button
           class="dock-item"
           title="设置"
-          @click="handleSettings"
+          @click="emit('openSettings')"
         >
-          <span class="dock-icon">⚙️</span>
-          <span class="dock-label">设置</span>
+          <svg class="dock-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span class="dock-label">Settings</span>
         </button>
       </div>
     </div>
@@ -122,14 +107,16 @@ const handleSpotlight = () => {
   box-shadow: 0 0 8px var(--accent-primary, #00d4ff);
 }
 
-.dock-icon {
-  font-size: 20px;
-  line-height: 1;
-  transition: transform 0.2s ease;
+.dock-svg-icon {
+  width: 20px;
+  height: 20px;
+  transition: transform 0.15s ease;
+  color: var(--text-secondary);
 }
 
-.dock-item:hover .dock-icon {
-  transform: scale(1.15);
+.dock-item:hover .dock-svg-icon,
+.dock-item.active .dock-svg-icon {
+  color: var(--text-primary);
 }
 
 .dock-label {
