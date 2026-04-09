@@ -12,6 +12,8 @@
     "ai-sidecar:dev": "tsx packages/ai-sidecar/src/server.ts"
   },
   "dependencies": {
+    "@langchain/core": "^1.1.39",
+    "@langchain/langgraph": "^1.2.8",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-shell": "^2.0.0",

@@ -12,9 +12,19 @@
  *   # Markdown body
  */
 
+import gitBranchingRaw from './skills/git-branching.md?raw'
+import releaseFlowRaw from './skills/release-flow.md?raw'
+import troubleshootingRaw from './skills/troubleshooting.md?raw'
+import workspaceTopologyRaw from './skills/workspace-topology.md?raw'
+
 const BUILTIN_SKILLS = {}
 
-const skillFiles = import.meta.glob('./skills/*.md', { eager: true, query: '?raw', import: 'default' })
+const skillFiles = {
+  './skills/git-branching.md': gitBranchingRaw,
+  './skills/release-flow.md': releaseFlowRaw,
+  './skills/troubleshooting.md': troubleshootingRaw,
+  './skills/workspace-topology.md': workspaceTopologyRaw
+}
 
 for (const [path, raw] of Object.entries(skillFiles)) {
   const { meta, body } = parseFrontmatter(raw)
