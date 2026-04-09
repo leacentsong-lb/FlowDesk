@@ -436,7 +436,9 @@ export function createAgentRuntime(options) {
         },
         onToolEnd(toolName, result) {
           if (signal.aborted || isRunStale(runId)) return
-          const toolStatus = result?.error || result?.ok === false ? 'error' : 'success'
+          const toolStatus = result?.recoverable
+            ? 'recovering'
+            : result?.error || result?.ok === false ? 'error' : 'success'
           const summary = result?.summary || (toolStatus === 'success' ? '执行完成' : '执行失败')
           const followupActions = toolStatus === 'error' ? createRetryActions(toolName) : null
 

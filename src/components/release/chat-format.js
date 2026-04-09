@@ -205,6 +205,10 @@ export function formatCompactToolText({ toolName, status, toolLabel = '', summar
     return `Tool(${safeToolName}): 正在执行 ${safeToolLabel}...`
   }
 
+  if (status === 'recovering') {
+    return `Tool(${safeToolName}): ${safeSummary || '参数不完整，Agent 正在自动修复后重试。'}`
+  }
+
   if (status === 'error') {
     return `Tool(${safeToolName}): ${safeSummary || '执行失败，请选择下一步操作。'}`
   }
@@ -356,6 +360,7 @@ export function getToolLabel(toolName, description = '') {
  */
 export function getStatusLabel(status) {
   if (status === 'running') return '运行中'
+  if (status === 'recovering') return '自动修复中'
   if (status === 'success') return '已完成'
   if (status === 'warning') return '需关注'
   if (status === 'error') return '失败'
@@ -368,6 +373,7 @@ export function getStatusLabel(status) {
  */
 export function getStatusTone(status) {
   if (status === 'running') return 'info'
+  if (status === 'recovering') return 'warning'
   if (status === 'success') return 'success'
   if (status === 'warning') return 'warning'
   if (status === 'error') return 'error'

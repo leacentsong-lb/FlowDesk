@@ -165,6 +165,51 @@ describe('agent runtime', () => {
     expect(agentReplies[0].text).toBe('admin 默认对应 Staff 系统。')
   })
 
+  it('renders recoverable tool validation issues as self-healing instead of hard failure', async () => {
+    mockLoadAgentMemories.mockResolvedValueOnce({
+      projectMemory: '',
+      userMemory: '',
+      summary: '',
+      sources: {
+        project: '/tmp/workspace/.flow-desk/AGENT.md',
+        user: '/Users/demo/.flow-desk/AGENT.md'
+      }
+    })
+
+    mockAgentLoop.mockImplementationOnce(async (_messages, options) => {
+      options.onToolEnd?.('read_file', {
+        ok: false,
+        error: '工具参数无效：read_file 缺少必填参数 path',
+        summary: '参数不完整，Agent 正在自动补齐后重试。',
+        recoverable: true,
+        recoveryKind: 'missing_required_params',
+        missingFields: ['path']
+      })
+
+      options.onText?.('已自动补齐参数并继续处理。')
+    })
+
+    const runtime = createAgentRuntime({
+      ctx: {
+        settings: { aiConfig: { apiKey: 'test-key' }, workspacePath: '/tmp/workspace' },
+        jira: {}
+      },
+      getState: () => ({
+        mode: 'general',
+        version: '',
+        environment: 'production',
+        completedTools: []
+      })
+    })
+
+    await runtime.runAgent('读一下 package.json')
+
+    const toolMessage = runtime.chatMessages.value.find(message => message.kind === 'tool')
+    expect(toolMessage.text).toContain('Agent 正在自动补齐后重试')
+    expect(toolMessage.status).toBe('recovering')
+    expect(toolMessage.actions || []).toHaveLength(0)
+  })
+
   it('ignores stale async text after stopping the current run', async () => {
     mockLoadAgentMemories.mockResolvedValueOnce({
       projectMemory: '',

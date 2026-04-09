@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { streamAgentMock, runCommandMock } = vi.hoisted(() => ({
+const { streamAgentMock, runCommandMock, readFileMock } = vi.hoisted(() => ({
   streamAgentMock: vi.fn(),
-  runCommandMock: vi.fn()
+  runCommandMock: vi.fn(),
+  readFileMock: vi.fn()
 }))
 
 vi.mock('../../ai/client.js', () => ({
@@ -13,7 +14,8 @@ vi.mock('../../ai/client.js', () => ({
 
 vi.mock('../tools/index.js', () => ({
   TOOL_HANDLERS: {
-    run_command: runCommandMock
+    run_command: runCommandMock,
+    read_file: readFileMock
   },
   TOOLS: [
     {
@@ -27,6 +29,20 @@ vi.mock('../tools/index.js', () => ({
             command: { type: 'string' }
           },
           required: ['command']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: '读取本地文件内容',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' }
+          },
+          required: ['path']
         }
       }
     }
@@ -45,10 +61,17 @@ describe('agent loop invalid tool calls', () => {
   beforeEach(() => {
     streamAgentMock.mockReset()
     runCommandMock.mockReset()
+    readFileMock.mockReset()
   })
 
-  it('does not execute run_command when tool arguments are invalid', async () => {
-    const messages = [{ role: 'user', content: '帮我执行 pwd' }]
+  it('treats missing required tool params as recoverable and lets the model self-correct', async () => {
+    const messages = [{ role: 'user', content: '读一下 package.json' }]
+
+    readFileMock.mockResolvedValueOnce({
+      ok: true,
+      summary: '已读取 package.json',
+      content: '{"name":"dev-helper"}'
+    })
 
     let modelCallCount = 0
     streamAgentMock.mockImplementation(async (payload, onEvent) => {
@@ -58,20 +81,45 @@ describe('agent loop invalid tool calls', () => {
         onEvent({
           kind: 'tool-call-delta',
           index: 0,
-          id: 'call_run_command',
-          name: 'run_command',
+          id: 'call_read_file_1',
+          name: 'read_file',
           argumentsFragment: '{}'
         })
         onEvent({ kind: 'done', finishReason: 'tool_calls' })
         return
       }
 
-      const toolResultMessage = payload.messages.find(message => message.role === 'tool')
-      expect(toolResultMessage?.content).toContain('工具参数无效')
-      onEvent({ kind: 'text-delta', text: '请补充 command 参数后再试。' })
+      if (modelCallCount === 2) {
+        const toolResultMessage = payload.messages.findLast(message => message.role === 'tool')
+        const toolResult = JSON.parse(toolResultMessage.content)
+        expect(toolResult).toMatchObject({
+          ok: false,
+          recoverable: true,
+          recoveryKind: 'missing_required_params',
+          missingFields: ['path']
+        })
+
+        onEvent({
+          kind: 'tool-call-delta',
+          index: 0,
+          id: 'call_read_file_2',
+          name: 'read_file',
+          argumentsFragment: '{"path":"package.json"}'
+        })
+        onEvent({ kind: 'done', finishReason: 'tool_calls' })
+        return
+      }
+
+      const toolResultMessage = payload.messages.findLast(message => message.role === 'tool')
+      expect(JSON.parse(toolResultMessage.content)).toMatchObject({
+        ok: true,
+        summary: '已读取 package.json'
+      })
+      onEvent({ kind: 'text-delta', text: '我已经读取 package.json。' })
       onEvent({ kind: 'done', finishReason: 'stop' })
     })
 
+    const onText = vi.fn()
     await agentLoop(messages, {
       ctx: {
         settings: {
@@ -89,15 +137,23 @@ describe('agent loop invalid tool calls', () => {
         environment: 'production',
         completedTools: []
       },
-      onText() {}
+      onText
     })
 
-    expect(runCommandMock).not.toHaveBeenCalled()
+    expect(modelCallCount).toBe(3)
+    expect(readFileMock).toHaveBeenCalledTimes(1)
+    expect(readFileMock).toHaveBeenCalledWith({ path: 'package.json' }, expect.anything())
+    expect(onText).toHaveBeenCalledWith('我已经读取 package.json。')
   })
 
-  it('stops auto-retrying after the same tool fails twice consecutively', async () => {
+  it('stops auto-retrying after the same non-recoverable tool fails twice consecutively', async () => {
     const messages = [{ role: 'user', content: '帮我执行 pwd' }]
     const onText = vi.fn()
+
+    runCommandMock.mockResolvedValue({
+      ok: false,
+      summary: '命令执行失败'
+    })
 
     let modelCallCount = 0
     streamAgentMock.mockImplementation(async (_payload, onEvent) => {
@@ -108,7 +164,7 @@ describe('agent loop invalid tool calls', () => {
         index: 0,
         id: `call_run_command_${modelCallCount}`,
         name: 'run_command',
-        argumentsFragment: '{}'
+        argumentsFragment: '{"command":"pwd"}'
       })
       onEvent({ kind: 'done', finishReason: 'tool_calls' })
     })
@@ -135,6 +191,6 @@ describe('agent loop invalid tool calls', () => {
 
     expect(modelCallCount).toBe(2)
     expect(onText).toHaveBeenCalledWith('工具 run_command 连续失败 2 次，已停止自动重试。请调整参数后再试，或使用手动重试。')
-    expect(runCommandMock).not.toHaveBeenCalled()
+    expect(runCommandMock).toHaveBeenCalledTimes(2)
   })
 })

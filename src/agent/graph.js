@@ -195,7 +195,7 @@ async function runToolsNode(graphState, runtimeConfig, options) {
     try {
       const validationError = validateToolCall(fnName, fnArgs)
       if (validationError) {
-        output = { error: validationError }
+        output = buildRecoverableValidationResult(fnName, validationError)
       } else if (!handler) {
         output = { error: `Unknown tool: ${fnName}` }
       } else {
@@ -205,7 +205,9 @@ async function runToolsNode(graphState, runtimeConfig, options) {
       output = { error: `Tool "${fnName}" 执行出错: ${error?.message || error}` }
     }
 
-    const toolStatus = output?.error || output?.ok === false ? 'error' : 'success'
+    const toolStatus = output?.recoverable
+      ? 'recovering'
+      : output?.error || output?.ok === false ? 'error' : 'success'
 
     recordTraceEvent(state?.traceSession, {
       type: 'tool.end',
@@ -390,21 +392,50 @@ function safeParseArgs(argsStr) {
 
 function validateToolCall(toolName, args) {
   if (!toolName) {
-    return '工具参数无效：缺少 tool name'
+    return {
+      code: 'missing_tool_name',
+      message: '工具参数无效：缺少 tool name'
+    }
   }
 
   const toolSchema = TOOLS.find(tool => tool.function?.name === toolName)?.function?.parameters
   if (!toolSchema) return null
 
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
-    return `工具参数无效：${toolName} 需要 object 参数`
+    return {
+      code: 'invalid_argument_shape',
+      message: `工具参数无效：${toolName} 需要 object 参数`
+    }
   }
 
   const requiredFields = Array.isArray(toolSchema.required) ? toolSchema.required : []
   const missingFields = requiredFields.filter(field => !(field in args) || args[field] == null)
   if (missingFields.length === 0) return null
 
-  return `工具参数无效：${toolName} 缺少必填参数 ${missingFields.join(', ')}`
+  return {
+    code: 'missing_required_params',
+    message: `工具参数无效：${toolName} 缺少必填参数 ${missingFields.join(', ')}`,
+    missingFields
+  }
+}
+
+function buildRecoverableValidationResult(toolName, validationError) {
+  const missingFields = Array.isArray(validationError?.missingFields) ? validationError.missingFields : []
+
+  return {
+    ok: false,
+    error: String(validationError?.message || '工具参数无效'),
+    summary: missingFields.length > 0
+      ? `参数不完整，Agent 正在自动补齐 ${missingFields.join(', ')} 后重试。`
+      : '参数格式不完整，Agent 正在自动调整后重试。',
+    recoverable: true,
+    recoveryKind: validationError?.code || 'validation_error',
+    toolName,
+    missingFields,
+    suggestion: missingFields.length > 0
+      ? `请补充必填参数 ${missingFields.join(', ')} 后重试。`
+      : '请按工具 schema 补齐并修正参数后重试。'
+  }
 }
 
 function trackToolFailure(state, toolName, args, toolStatus) {
