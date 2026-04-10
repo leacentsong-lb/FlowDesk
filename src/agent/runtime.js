@@ -8,7 +8,7 @@
  * - typewriter effect
  * - soft cancellation via AbortController + runId
  */
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { agentLoop, TOOLS } from './index.js'
 import { loadAgentMemories } from './memory.js'
 import { defaultSkillLoader } from './skills.js'
@@ -43,6 +43,8 @@ export function createAgentRuntime(options) {
   const typingFullText = ref('')
   const streamingMessageId = ref('')
   const primedSkillContents = new Map()
+  const primedSkillNames = computed(() => [...primedSkillContents.keys()])
+  const primedSkillBundle = computed(() => buildPrimedSkillBundle())
 
   /**
    * @param {string} role
@@ -530,6 +532,8 @@ export function createAgentRuntime(options) {
     chatMessages,
     agentMessages,
     agentRunning,
+    primedSkillNames,
+    primedSkillBundle,
     pushMessage,
     runAgent,
     stopAgentChat,

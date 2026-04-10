@@ -84,4 +84,28 @@ describe('agent context', () => {
     expect(prompt).toContain('## Memory')
     expect(prompt).toContain('Project memory: repo mapping already confirmed')
   })
+
+  it('supports prompt config overrides for role, workflow and response rules', () => {
+    const prompt = buildSystemPrompt({
+      mode: 'general',
+      workspacePath: '/Users/demo/workspace',
+      promptConfig: {
+        role: {
+          generalIntro: '你是一个可调试的 Prompt Agent。'
+        },
+        workflow: {
+          general: '- 回答前先输出当前 Prompt Profile。'
+        },
+        responseRules: [
+          '先给结论，再给细节',
+          '输出末尾追加 [PromptDebug]'
+        ]
+      }
+    })
+
+    expect(prompt).toContain('你是一个可调试的 Prompt Agent。')
+    expect(prompt).toContain('回答前先输出当前 Prompt Profile')
+    expect(prompt).toContain('先给结论，再给细节')
+    expect(prompt).toContain('输出末尾追加 [PromptDebug]')
+  })
 })

@@ -131,6 +131,13 @@ function handleStopChat() {
 }
 
 /**
+ * @returns {void}
+ */
+function openPromptStudio() {
+  window.dispatchEvent(new CustomEvent('open-settings', { detail: { tab: 'prompt' } }))
+}
+
+/**
  * @param {KeyboardEvent} event
  * @returns {void}
  */
@@ -287,6 +294,14 @@ onMounted(() => {
       <div class="topbar-right">
         <span v-if="release.version" class="chat-version">v{{ release.version }}</span>
         <span class="session-badge" :class="`tone-${sessionState.tone}`">{{ sessionState.label }}</span>
+        <button
+          data-testid="open-prompt-studio-btn"
+          class="icon-btn"
+          title="打开提示词调试台"
+          @click="openPromptStudio"
+        >
+          Prompt
+        </button>
         <button
           v-if="release.agentRunning"
           data-testid="chat-stop-btn"

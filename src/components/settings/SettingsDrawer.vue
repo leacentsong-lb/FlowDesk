@@ -5,6 +5,7 @@ import { ref, watch } from 'vue'
 import { useSettingsStore } from '../../stores/settings'
 import { useJiraStore } from '../../stores/jira'
 import { aiClient } from '../../ai/client.js'
+import PromptStudioPanel from '../prompt/PromptStudioPanel.vue'
 
 const props = defineProps({
   open: Boolean,
@@ -176,6 +177,13 @@ watch(
             @click="emit('update:tab', 'github')"
           >
             🐙 GitHub
+          </button>
+          <button
+            class="settings-tab"
+            :class="{ active: tab === 'prompt' }"
+            @click="emit('update:tab', 'prompt')"
+          >
+            🧠 提示词
           </button>
         </div>
 
@@ -426,6 +434,10 @@ watch(
                 <button v-if="settings.githubTokenSaved" class="clear-btn" @click="settings.clearGithubToken">清除 Token</button>
               </div>
             </div>
+          </div>
+
+          <div v-if="tab === 'prompt'" class="settings-section">
+            <PromptStudioPanel />
           </div>
         </div>
       </aside>

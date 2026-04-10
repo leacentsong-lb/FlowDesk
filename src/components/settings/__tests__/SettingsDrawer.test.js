@@ -122,6 +122,19 @@ describe('SettingsDrawer', () => {
     expect(wrapper.get('[data-testid="ai-project-input"]').exists()).toBe(true)
   })
 
+  it('renders a prompt tab with editor and preview panels', () => {
+    const wrapper = mount(SettingsDrawer, {
+      props: {
+        open: true,
+        tab: 'prompt'
+      }
+    })
+
+    expect(wrapper.text()).toContain('提示词')
+    expect(wrapper.find('[data-testid="prompt-general-role-input"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="prompt-preview"]').exists()).toBe(true)
+  })
+
   it('tests the AI connection with the current provider config', async () => {
     aiClientMock.testConnection.mockResolvedValue({
       ok: true,

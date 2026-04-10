@@ -203,4 +203,17 @@ describe('AgentChatPanel', () => {
 
     expect(wrapper.find('[data-testid="chat-stop-btn"]').exists()).toBe(true)
   })
+
+  it('opens prompt settings from the chat topbar', async () => {
+    const release = useReleaseStore()
+    vi.spyOn(release, 'agentStart').mockImplementation(() => {})
+    const dispatchEventSpy = vi.spyOn(window, 'dispatchEvent')
+
+    const wrapper = mount(AgentChatPanel)
+    await wrapper.get('[data-testid="open-prompt-studio-btn"]').trigger('click')
+
+    expect(dispatchEventSpy).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'open-settings'
+    }))
+  })
 })

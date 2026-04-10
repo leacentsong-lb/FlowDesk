@@ -6,6 +6,7 @@ import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
 import { useSettingsStore } from './settings'
 import { useJiraStore } from './jira'
+import { usePromptStore } from './prompt'
 import { TOOLS } from '../agent/index.js'
 import { routeAgentIntent } from '../agent/router.js'
 import { createAgentRuntime } from '../agent/runtime.js'
@@ -14,6 +15,7 @@ import { pushTraceEntry } from '../agent/tracing.js'
 export const useReleaseStore = defineStore('release', () => {
   const settings = useSettingsStore()
   const jira = useJiraStore()
+  const prompt = usePromptStore()
   const RELEASE_TOOL_NAMES = new Set([
     'check_credentials',
     'fetch_jira_versions',
@@ -56,7 +58,8 @@ export const useReleaseStore = defineStore('release', () => {
       version: version.value,
       environment: environment.value,
       workspacePath: settings.workspacePath,
-      completedTools: completedTools.value
+      completedTools: completedTools.value,
+      promptConfig: prompt.config
     }),
     onToolStart({ toolName, args }) {
       if (RELEASE_TOOL_NAMES.has(toolName)) {
@@ -248,6 +251,8 @@ export const useReleaseStore = defineStore('release', () => {
     buildStatus,
     traces,
     chatMessages: runtime.chatMessages,
+    primedSkillNames: runtime.primedSkillNames,
+    primedSkillBundle: runtime.primedSkillBundle,
     pushMessage: runtime.pushMessage,
     agentStart,
     agentChat,
