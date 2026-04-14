@@ -10,6 +10,9 @@ vi.mock('../../agent/runtime.js', () => ({
   createAgentRuntime: vi.fn(() => ({
     agentRunning: ref(false),
     chatMessages: ref([]),
+    pendingInteraction: ref(null),
+    presentInteraction: vi.fn(),
+    clearPendingInteraction: vi.fn(),
     pushMessage: vi.fn(),
     runAgent: mockRunAgent,
     stopAgentChat: vi.fn(),
@@ -39,8 +42,8 @@ describe('release store intent routing', () => {
       expect.objectContaining({
         route: expect.objectContaining({
           mode: 'general',
-          intent: 'workspace_inventory',
-          shouldPrimeWorkspaceSkill: true
+          workflowId: 'general',
+          requiresApproval: false
         })
       })
     )
@@ -58,8 +61,8 @@ describe('release store intent routing', () => {
       expect.objectContaining({
         route: expect.objectContaining({
           mode: 'release',
-          intent: 'release_flow',
-          shouldPrimeWorkspaceSkill: false
+          workflowId: 'release',
+          riskLevel: 'high'
         })
       })
     )
@@ -80,8 +83,8 @@ describe('release store intent routing', () => {
       expect.objectContaining({
         route: expect.objectContaining({
           mode: 'release',
-          intent: 'release_flow',
-          shouldPrimeWorkspaceSkill: false
+          workflowId: 'release',
+          riskLevel: 'high'
         })
       })
     )

@@ -6,7 +6,8 @@ import {
   getStatusTone,
   normalizeChatMessage,
   renderCode,
-  renderMarkdown
+  renderMarkdown,
+  summarizeReasoning
 } from './chat-format.js'
 
 const emit = defineEmits(['navigate-home'])
@@ -54,6 +55,15 @@ const quickActions = computed(() => {
     { id: 'quick-release', label: '进入发布流程', text: '我要开始一次生产发布，请先检查凭证并引导我继续。' }
   ]
 })
+
+function unwrapInteraction(value) {
+  if (value && typeof value === 'object' && 'value' in value) {
+    return value.value || null
+  }
+  return value || null
+}
+
+const pendingInteraction = computed(() => unwrapInteraction(release.pendingInteraction))
 
 /**
  * @returns {void}
@@ -107,6 +117,15 @@ function getActionVariant(action) {
  */
 function handleAction(actionId) {
   release.handleChatAction(actionId)
+}
+
+/**
+ * @param {object} action
+ * @returns {void}
+ */
+function handleDockedAction(action) {
+  if (!action?.id) return
+  handleAction(action.id)
 }
 
 /**
@@ -247,6 +266,14 @@ function getActivityName(message) {
 }
 
 /**
+ * @param {object} message
+ * @returns {string}
+ */
+function getReasoningSummary(message) {
+  return summarizeReasoning(message?._reasoning || '')
+}
+
+/**
  * @param {object} quickAction
  * @returns {void}
  */
@@ -350,9 +377,11 @@ onMounted(() => {
               </div>
 
               <details v-if="msg._reasoning" class="reasoning-block">
-                <summary class="reasoning-toggle">
+                <summary data-testid="reasoning-summary" class="reasoning-toggle">
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                  思考过程
+                  <span class="reasoning-label">思考</span>
+                  <span class="reasoning-preview">{{ getReasoningSummary(msg) }}</span>
+                  <span class="reasoning-action">展开</span>
                 </summary>
                 <pre class="reasoning-text">{{ msg._reasoning }}</pre>
               </details>
@@ -425,19 +454,6 @@ onMounted(() => {
                     <pre class="json-surface">{{ formatJsonBlock(block) }}</pre>
                   </div>
 
-                  <div v-else-if="block.type === 'actions'" class="message-block msg-actions">
-                    <button
-                      v-for="action in block.items"
-                      :key="action.id"
-                      :data-testid="`chat-action-${action.id}`"
-                      class="action-btn"
-                      :class="[`variant-${getActionVariant(action)}`]"
-                      :disabled="isActionDisabled(action)"
-                      @click="handleAction(action.id)"
-                    >
-                      {{ action.label }}
-                    </button>
-                  </div>
                 </template>
               </div>
             </div>
@@ -459,6 +475,32 @@ onMounted(() => {
 
     <footer data-testid="chat-composer" class="composer-panel">
       <div class="composer-inner">
+        <div
+          v-if="pendingInteraction"
+          data-testid="chat-docked-interaction"
+          class="docked-interaction"
+        >
+          <div class="docked-interaction-copy">
+            <div class="docked-interaction-title">{{ pendingInteraction.title }}</div>
+            <div v-if="pendingInteraction.description" class="docked-interaction-description">
+              {{ pendingInteraction.description }}
+            </div>
+          </div>
+          <div class="docked-interaction-actions">
+            <button
+              v-for="action in pendingInteraction.actions"
+              :key="action.id"
+              :data-testid="`chat-action-${action.id}`"
+              class="action-btn docked-action-btn"
+              :class="[`variant-${getActionVariant(action)}`]"
+              :disabled="isActionDisabled(action)"
+              @click="handleDockedAction(action)"
+            >
+              {{ action.label }}
+            </button>
+          </div>
+        </div>
+
         <div class="composer-shell">
           <span class="composer-prefix">Agent</span>
           <textarea
@@ -496,7 +538,7 @@ onMounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 12px 16px;
+  padding: 10px 14px;
   border-bottom: 1px solid color-mix(in srgb, var(--glass-border) 82%, transparent);
   background: color-mix(in srgb, var(--bg-secondary) 94%, transparent);
   backdrop-filter: blur(12px);
@@ -641,7 +683,7 @@ onMounted(() => {
 .chat-timeline {
   flex: 1;
   overflow-y: auto;
-  padding: 18px 0 136px;
+  padding: 12px 0 112px;
 }
 
 .timeline-inner {
@@ -649,7 +691,7 @@ onMounted(() => {
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 12px;
 }
 
 .timeline-empty {
@@ -724,7 +766,7 @@ onMounted(() => {
 
 .timeline-entry {
   display: flex;
-  gap: 14px;
+  gap: 10px;
   animation: msg-in 0.18s ease-out;
 }
 
@@ -780,7 +822,7 @@ onMounted(() => {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 5px;
 }
 
 .entry-meta {
@@ -818,13 +860,13 @@ onMounted(() => {
 .user-inline {
   width: fit-content;
   max-width: 100%;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border-radius: 10px;
   border: 1px solid color-mix(in srgb, var(--glass-border) 88%, transparent);
   background: color-mix(in srgb, var(--bg-secondary) 94%, transparent);
   color: var(--text-primary);
   font-size: 13px;
-  line-height: 1.65;
+  line-height: 1.52;
   white-space: pre-wrap;
   overflow-wrap: break-word;
 }
@@ -832,7 +874,7 @@ onMounted(() => {
 .message-shell {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 7px;
   min-width: 0;
 }
 
@@ -862,8 +904,8 @@ onMounted(() => {
 .tool-card {
   display: inline-flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
+  gap: 6px;
+  padding: 8px 10px;
 }
 
 .activity-header {
@@ -931,7 +973,7 @@ onMounted(() => {
 .tool-summary {
   margin: 0;
   font-size: 12px;
-  line-height: 1.6;
+  line-height: 1.45;
   color: var(--text-secondary);
   white-space: pre-wrap;
 }
@@ -942,7 +984,7 @@ onMounted(() => {
 }
 
 .tool-details {
-  margin-top: 10px;
+  margin-top: 6px;
 }
 
 .tool-details summary {
@@ -964,12 +1006,13 @@ onMounted(() => {
 
 .tool-json,
 .reasoning-text {
-  margin-top: 8px;
-  padding: 12px;
+  margin-top: 6px;
+  padding: 10px;
   border-radius: 10px;
   border: 1px solid color-mix(in srgb, var(--glass-border) 84%, transparent);
   background: color-mix(in srgb, var(--bg-primary) 86%, transparent);
   color: var(--text-secondary);
+  max-height: 160px;
 }
 
 .code-toolbar,
@@ -978,8 +1021,8 @@ onMounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  min-height: 36px;
-  padding: 0 12px;
+  min-height: 32px;
+  padding: 0 10px;
   border-bottom: 1px solid color-mix(in srgb, var(--glass-border) 86%, transparent);
   background: color-mix(in srgb, var(--bg-primary) 46%, var(--bg-secondary));
 }
@@ -1013,7 +1056,7 @@ onMounted(() => {
 
 .code-surface,
 .json-surface {
-  padding: 14px;
+  padding: 10px 12px;
   color: var(--text-primary);
   background: color-mix(in srgb, var(--bg-primary) 44%, var(--bg-secondary));
 }
@@ -1021,12 +1064,54 @@ onMounted(() => {
 .msg-actions {
   display: flex;
   flex-wrap: wrap;
+  gap: 6px;
+}
+
+.docked-interaction {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 22%, var(--glass-border));
+  background: color-mix(in srgb, var(--bg-secondary) 94%, transparent);
+  box-shadow: 0 10px 24px color-mix(in srgb, black 10%, transparent);
+}
+
+.docked-interaction-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.docked-interaction-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.docked-interaction-description {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.docked-interaction-actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
+.docked-action-btn {
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: 10px;
+}
+
 .action-btn {
-  min-height: 28px;
-  padding: 0 10px;
+  min-height: 26px;
+  padding: 0 9px;
   border-radius: 8px;
   border: 1px solid color-mix(in srgb, var(--glass-border) 86%, transparent);
   font-size: 12px;
@@ -1070,14 +1155,15 @@ onMounted(() => {
 }
 
 .reasoning-block {
-  margin-bottom: 2px;
+  margin-bottom: 0;
+  align-self: flex-start;
 }
 
 .reasoning-toggle {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  min-height: 24px;
+  min-height: 22px;
   padding: 0 8px;
   border-radius: 999px;
   border: 1px solid color-mix(in srgb, var(--glass-border) 84%, transparent);
@@ -1085,13 +1171,41 @@ onMounted(() => {
   font-size: 11px;
   color: var(--text-tertiary);
   cursor: pointer;
+  max-width: min(100%, 640px);
+}
+
+.reasoning-label {
+  flex-shrink: 0;
+}
+
+.reasoning-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.reasoning-action {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.reasoning-block[open] .reasoning-action {
+  display: none;
+}
+
+.reasoning-block[open] .reasoning-toggle::after {
+  content: '收起';
+  margin-left: 2px;
+  color: var(--text-tertiary);
 }
 
 .thinking-indicator {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  min-height: 28px;
+  min-height: 22px;
 }
 
 .thinking-dot {
@@ -1118,7 +1232,7 @@ onMounted(() => {
 
 .composer-panel {
   flex-shrink: 0;
-  padding: 12px 16px 16px;
+  padding: 8px 14px 12px;
   background:
     linear-gradient(to top, color-mix(in srgb, var(--bg-secondary) 98%, transparent), color-mix(in srgb, var(--bg-secondary) 72%, transparent), transparent);
 }
@@ -1132,7 +1246,7 @@ onMounted(() => {
   display: flex;
   align-items: flex-end;
   gap: 10px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border-radius: 12px;
   border: 1px solid color-mix(in srgb, var(--glass-border) 92%, transparent);
   background: color-mix(in srgb, var(--bg-secondary) 96%, transparent);
@@ -1162,9 +1276,9 @@ onMounted(() => {
 
 .chat-input {
   flex: 1;
-  min-height: 36px;
+  min-height: 32px;
   max-height: 180px;
-  padding: 6px 0;
+  padding: 4px 0;
   resize: none;
   overflow-y: auto;
   border: none;
@@ -1172,7 +1286,7 @@ onMounted(() => {
   background: transparent;
   color: var(--text-primary);
   font-size: 14px;
-  line-height: 24px;
+  line-height: 22px;
   box-sizing: border-box;
 }
 
@@ -1185,8 +1299,8 @@ onMounted(() => {
 }
 
 .send-btn {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1212,7 +1326,7 @@ onMounted(() => {
 .composer-hint-row {
   display: flex;
   justify-content: flex-end;
-  padding-top: 6px;
+  padding-top: 4px;
 }
 
 .input-hint {

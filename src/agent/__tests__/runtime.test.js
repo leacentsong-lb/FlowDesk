@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { defaultSkillLoader } from '../skills.js'
+import { resolveAgentWorkflow } from '../workflows/index.js'
 
 const { mockAgentLoop } = vi.hoisted(() => ({
   mockAgentLoop: vi.fn()
@@ -45,7 +45,7 @@ describe('agent runtime', () => {
     vi.useRealTimers()
   })
 
-  it('suppresses verbose follow-up text after version actions are shown', async () => {
+  it('suppresses all follow-up assistant text after version interaction is shown', async () => {
     mockLoadAgentMemories.mockResolvedValueOnce({
       projectMemory: 'project memory',
       userMemory: 'user memory',
@@ -65,6 +65,7 @@ describe('agent runtime', () => {
         versions: [{ name: '3.8.4' }]
       })
 
+      options.onEvent?.({ type: 'assistant.completed', text: '请选择要继续处理的版本。' })
       options.onText?.('根据当前分析，请确认您要发布哪个版本到生产环境。')
     })
 
@@ -81,11 +82,18 @@ describe('agent runtime', () => {
       })
     })
 
-    await runtime.runAgent('发布生产环境，请开始检查凭证并获取版本列表。')
+    await runtime.runAgent('发布生产环境，请开始检查凭证并获取版本列表。', {
+      workflow: resolveAgentWorkflow('release')
+    })
 
     const texts = runtime.chatMessages.value.map(message => message.text)
-    expect(texts).toContain('请选择要继续处理的版本。')
+    expect(texts).not.toContain('请选择要继续处理的版本。')
     expect(texts.join('\n')).not.toContain('根据当前分析')
+    expect(runtime.pendingInteraction.value).toMatchObject({
+      type: 'action-list',
+      title: '选择发布版本'
+    })
+    expect(runtime.pendingInteraction.value.actions.map(action => action.id)).toContain('version-3.8.4')
   })
 
   it('streams assistant text from incremental agent events', async () => {
@@ -255,7 +263,7 @@ describe('agent runtime', () => {
     expect(runtime.chatMessages.value.map(message => message.text).join('\n')).not.toContain('旧消息不应该继续显示')
   })
 
-  it('primes workspace-topology once for workspace mapping routes', async () => {
+  it('passes workflow tool subsets down to the agent loop', async () => {
     mockLoadAgentMemories.mockResolvedValue({
       projectMemory: '',
       userMemory: '',
@@ -266,105 +274,19 @@ describe('agent runtime', () => {
       }
     })
 
-    mockAgentLoop.mockImplementation(async (_messages, options) => {
-      expect(options.state.primedSkillNames).toContain('workspace-topology')
-      expect(options.state.primedSkillBundle).toContain('<skill name="workspace-topology">')
-    })
-
-    const loadSpy = vi.spyOn(defaultSkillLoader, 'load')
-
-    const runtime = createAgentRuntime({
-      ctx: {
-        settings: { aiConfig: { apiKey: 'test-key' }, workspacePath: '/tmp/workspace' },
-        jira: {}
-      },
-      getState: () => ({
-        mode: 'general',
-        version: '',
-        environment: 'production',
-        completedTools: []
-      })
-    })
-
-    await runtime.runAgent('admin 对应哪个仓库', {
-      route: {
-        mode: 'general',
-        intent: 'workspace_mapping',
-        shouldPrimeWorkspaceSkill: true,
-        shouldScanWorkspaceFirst: false
+    const releaseTools = [
+      {
+        type: 'function',
+        function: {
+          name: 'fetch_jira_versions',
+          description: '获取 Jira 版本'
+        }
       }
-    })
-
-    expect(loadSpy).toHaveBeenCalledTimes(1)
-    expect(loadSpy).toHaveBeenCalledWith('workspace-topology')
-  })
-
-  it('does not reload workspace-topology in the same runtime session', async () => {
-    mockLoadAgentMemories.mockResolvedValue({
-      projectMemory: '',
-      userMemory: '',
-      summary: '',
-      sources: {
-        project: '/tmp/workspace/.flow-desk/AGENT.md',
-        user: '/Users/demo/.flow-desk/AGENT.md'
-      }
-    })
-
-    mockAgentLoop.mockResolvedValue(undefined)
-
-    const loadSpy = vi.spyOn(defaultSkillLoader, 'load')
-
-    const runtime = createAgentRuntime({
-      ctx: {
-        settings: { aiConfig: { apiKey: 'test-key' }, workspacePath: '/tmp/workspace' },
-        jira: {}
-      },
-      getState: () => ({
-        mode: 'general',
-        version: '',
-        environment: 'production',
-        completedTools: []
-      })
-    })
-
-    await runtime.runAgent('admin 对应哪个仓库', {
-      route: {
-        mode: 'general',
-        intent: 'workspace_mapping',
-        shouldPrimeWorkspaceSkill: true,
-        shouldScanWorkspaceFirst: false
-      }
-    })
-    await runtime.runAgent('后台系统是哪一个 repo', {
-      route: {
-        mode: 'general',
-        intent: 'workspace_mapping',
-        shouldPrimeWorkspaceSkill: true,
-        shouldScanWorkspaceFirst: false
-      }
-    })
-
-    expect(loadSpy).toHaveBeenCalledTimes(1)
-    expect(loadSpy).toHaveBeenCalledWith('workspace-topology')
-  })
-
-  it('does not prime workspace-topology for release routes', async () => {
-    mockLoadAgentMemories.mockResolvedValue({
-      projectMemory: '',
-      userMemory: '',
-      summary: '',
-      sources: {
-        project: '/tmp/workspace/.flow-desk/AGENT.md',
-        user: '/Users/demo/.flow-desk/AGENT.md'
-      }
-    })
+    ]
 
     mockAgentLoop.mockImplementationOnce(async (_messages, options) => {
-      expect(options.state.primedSkillNames || []).not.toContain('workspace-topology')
-      expect(options.state.primedSkillBundle).toBe('')
+      expect(options.tools).toEqual(releaseTools)
     })
-
-    const loadSpy = vi.spyOn(defaultSkillLoader, 'load')
 
     const runtime = createAgentRuntime({
       ctx: {
@@ -372,7 +294,7 @@ describe('agent runtime', () => {
         jira: {}
       },
       getState: () => ({
-        mode: 'release',
+        mode: 'general',
         version: '',
         environment: 'production',
         completedTools: []
@@ -380,18 +302,11 @@ describe('agent runtime', () => {
     })
 
     await runtime.runAgent('发布生产环境，请开始检查', {
-      route: {
-        mode: 'release',
-        intent: 'release_flow',
-        shouldPrimeWorkspaceSkill: false,
-        shouldScanWorkspaceFirst: false
-      }
+      tools: releaseTools
     })
-
-    expect(loadSpy).not.toHaveBeenCalled()
   })
 
-  it('primes git-branching for commit message routes', async () => {
+  it('caches loaded skills after the model explicitly loads them', async () => {
     mockLoadAgentMemories.mockResolvedValue({
       projectMemory: '',
       userMemory: '',
@@ -402,12 +317,21 @@ describe('agent runtime', () => {
       }
     })
 
-    mockAgentLoop.mockImplementationOnce(async (_messages, options) => {
-      expect(options.state.primedSkillNames).toContain('git-branching')
-      expect(options.state.primedSkillBundle).toContain('<skill name="git-branching">')
-    })
-
-    const loadSpy = vi.spyOn(defaultSkillLoader, 'load')
+    mockAgentLoop
+      .mockImplementationOnce(async (_messages, options) => {
+        expect(options.state.primedSkillNames || []).toEqual([])
+        expect(options.state.primedSkillBundle).toBe('')
+        options.onToolEnd?.('load_skill', {
+          ok: true,
+          skillName: 'git-branching',
+          summary: '已加载技能：git-branching',
+          content: '<skill name="git-branching">branch rules</skill>'
+        })
+      })
+      .mockImplementationOnce(async (_messages, options) => {
+        expect(options.state.primedSkillNames).toContain('git-branching')
+        expect(options.state.primedSkillBundle).toContain('branch rules')
+      })
 
     const runtime = createAgentRuntime({
       ctx: {
@@ -415,24 +339,16 @@ describe('agent runtime', () => {
         jira: {}
       },
       getState: () => ({
-        mode: 'general',
+        mode: 'release',
         version: '',
         environment: 'production',
         completedTools: []
       })
     })
 
-    await runtime.runAgent('请根据当前本地分支帮我生成 commit message', {
-      route: {
-        mode: 'general',
-        intent: 'git_commit_message',
-        shouldPrimeWorkspaceSkill: false,
-        shouldScanWorkspaceFirst: false,
-        primeSkillNames: ['git-branching']
-      }
-    })
+    await runtime.runAgent('先加载 git branching skill')
+    await runtime.runAgent('请根据当前分支生成 commit message')
 
-    expect(loadSpy).toHaveBeenCalledWith('git-branching')
     expect(runtime.chatMessages.value.some(message =>
       message.kind === 'skill' &&
       String(message.text || '').includes('git-branching')

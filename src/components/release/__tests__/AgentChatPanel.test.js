@@ -63,30 +63,26 @@ describe('AgentChatPanel', () => {
     expect(wrapper.text()).toContain('"status": "ok"')
   })
 
-  it('dispatches rich action button clicks through the store', async () => {
+  it('renders docked interactions above the composer and dispatches clicks through the store', async () => {
     const release = useReleaseStore()
     vi.spyOn(release, 'agentStart').mockImplementation(() => {})
     const handleChatAction = vi.spyOn(release, 'handleChatAction').mockImplementation(() => {})
 
     const wrapper = mount(AgentChatPanel)
 
-    release.chatMessages = [
-      {
-        id: 'agent-actions',
-        role: 'agent',
-        ts: new Date('2026-04-07T10:01:00Z'),
-        blocks: [
-          {
-            type: 'actions',
-            items: [
-              { id: 'confirm-release', label: '确认发布', variant: 'primary' }
-            ]
-          }
-        ]
-      }
-    ]
+    release.pendingInteraction = {
+      id: 'interaction-1',
+      type: 'action-list',
+      title: '选择下一步',
+      actions: [
+        { id: 'confirm-release', label: '确认发布', variant: 'primary' }
+      ]
+    }
 
     await nextTick()
+
+    expect(wrapper.find('[data-testid="chat-docked-interaction"]').exists()).toBe(true)
+    expect(wrapper.find('.msg-actions').exists()).toBe(false)
     await wrapper.get('[data-testid="chat-action-confirm-release"]').trigger('click')
 
     expect(handleChatAction).toHaveBeenCalledWith('confirm-release')
@@ -151,6 +147,30 @@ describe('AgentChatPanel', () => {
     expect(card.attributes('data-activity-kind')).toBe('skill')
     expect(card.text()).toContain('SKILL')
     expect(card.text()).toContain('git-branching')
+  })
+
+  it('renders reasoning as a compact summary chip by default', async () => {
+    const release = useReleaseStore()
+    vi.spyOn(release, 'agentStart').mockImplementation(() => {})
+
+    const wrapper = mount(AgentChatPanel)
+
+    release.chatMessages = [
+      {
+        id: 'agent-reasoning',
+        role: 'agent',
+        ts: new Date('2026-04-08T10:03:00Z'),
+        text: '我已经完成分析。',
+        _reasoning: '先检查当前工作区配置，再确认可用工具，最后决定下一步。'
+      }
+    ]
+
+    await nextTick()
+
+    const summary = wrapper.find('[data-testid="reasoning-summary"]')
+    expect(summary.exists()).toBe(true)
+    expect(summary.text()).toContain('思考')
+    expect(summary.text()).toContain('先检查当前工作区配置')
   })
 
   it('does not expose full skill body in the chat UI', async () => {

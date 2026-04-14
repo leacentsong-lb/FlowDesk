@@ -32,7 +32,7 @@ describe('release store action-first replies', () => {
     mockAgentLoop.mockReset()
   })
 
-  it('suppresses verbose follow-up text after version actions are already shown', async () => {
+  it('keeps only the docked version interaction and suppresses follow-up assistant text', async () => {
     mockAgentLoop.mockImplementationOnce(async (_messages, options) => {
       options.onToolEnd?.('fetch_jira_versions', {
         ok: true,
@@ -58,11 +58,12 @@ describe('release store action-first replies', () => {
 
     const texts = release.chatMessages.map(message => message.text)
 
-    expect(texts).toContain('请选择要继续处理的版本。')
+    expect(texts).not.toContain('请选择要继续处理的版本。')
     expect(texts.join('\n')).not.toContain('根据当前分析')
-    expect(release.chatMessages.some(message =>
-      message.actions?.some(action => action.id === 'version-3.8.4')
-    )).toBe(true)
+    expect(release.pendingInteraction).toMatchObject({
+      title: '选择发布版本'
+    })
+    expect(release.pendingInteraction.actions.some(action => action.id === 'version-3.8.4')).toBe(true)
   })
 
   it('keeps a short follow-up message when the release flow is blocked', async () => {
@@ -83,11 +84,7 @@ describe('release store action-first replies', () => {
     const compactTexts = release.chatMessages.map(message => message.meta?.compactText).filter(Boolean)
 
     expect(compactTexts).toContain('Tool(run_preflight): 预检失败，请选择下一步操作。')
-    expect(release.chatMessages.some(message =>
-      message.role === 'agent' && message.kind !== 'tool' && message.text.startsWith('检测到')
-    )).toBe(true)
-    expect(release.chatMessages.some(message =>
-      message.actions?.some(action => action.id === 'retry-run_preflight')
-    )).toBe(true)
+    expect(texts.join('\n')).not.toContain('检测到阻塞')
+    expect(release.pendingInteraction.actions.some(action => action.id === 'retry-run_preflight')).toBe(true)
   })
 })

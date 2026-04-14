@@ -11,12 +11,11 @@
 import { computed, ref } from 'vue'
 import { agentLoop, TOOLS } from './index.js'
 import { loadAgentMemories } from './memory.js'
-import { defaultSkillLoader } from './skills.js'
 import { createTraceSession, finalizeTrace, snapshotTrace } from './tracing.js'
 import {
   formatCompactToolText,
-  getActionPromptText,
   getToolLabel,
+  getActionPromptText,
   normalizeChatMessage
 } from '../components/release/chat-format.js'
 
@@ -37,7 +36,9 @@ export function createAgentRuntime(options) {
   const agentRunning = ref(false)
   const runAbortController = ref(null)
   const activeRunId = ref('')
+  const pendingInteraction = ref(null)
   const suppressNextAgentTextMode = ref('')
+  const suppressPendingOnText = ref(false)
   const typingTimer = ref(null)
   const typingMessageId = ref('')
   const typingFullText = ref('')
@@ -67,6 +68,43 @@ export function createAgentRuntime(options) {
       _streaming: options._streaming,
       _reasoning: options._reasoning
     }))
+  }
+
+  /**
+   * @param {object | null} interaction
+   * @param {object} [options]
+   * @param {boolean} [options.suppressNextAssistantText]
+   * @returns {void}
+   */
+  function presentInteraction(interaction, options = {}) {
+    const actions = Array.isArray(interaction?.actions) ? interaction.actions : []
+    if (!interaction || actions.length === 0) {
+      pendingInteraction.value = null
+      return
+    }
+
+    pendingInteraction.value = {
+      id: interaction.id || `${Date.now()}-${Math.random()}`,
+      type: interaction.type || 'action-list',
+      title: interaction.title || getActionPromptText(actions),
+      description: interaction.description || '',
+      actions,
+      meta: interaction.meta || {}
+    }
+
+    if (options.suppressNextAssistantText) {
+      suppressNextAgentTextMode.value = 'interaction'
+      suppressPendingOnText.value = true
+      stopTyping(false)
+      streamingMessageId.value = ''
+    }
+  }
+
+  /**
+   * @returns {void}
+   */
+  function clearPendingInteraction() {
+    pendingInteraction.value = null
   }
 
   /**
@@ -225,18 +263,6 @@ export function createAgentRuntime(options) {
   }
 
   /**
-   * @param {object} result
-   * @returns {Array<object>}
-   */
-  function buildVersionActions(result) {
-    return (result.versions || []).slice(0, 8).map(versionOption => ({
-      id: `version-${versionOption.name}`,
-      label: versionOption.name,
-      variant: 'secondary'
-    }))
-  }
-
-  /**
    * @param {string} toolName
    * @param {unknown} payload
    * @returns {unknown}
@@ -258,36 +284,6 @@ export function createAgentRuntime(options) {
   }
 
   /**
-   * @param {object} route
-   * @returns {void}
-   */
-  function primeSkills(route) {
-    const skillNames = new Set(route?.primeSkillNames || [])
-
-    if (route?.shouldPrimeWorkspaceSkill) {
-      skillNames.add('workspace-topology')
-    }
-
-    for (const skillName of skillNames) {
-      if (!skillName || primedSkillContents.has(skillName)) continue
-
-      const content = defaultSkillLoader.load(skillName)
-      if (!content || content.startsWith('Error:')) continue
-
-      primedSkillContents.set(skillName, content)
-      pushMessage('agent', `Skill(${skillName}): 已注入到当前对话。`, null, {
-        kind: 'skill',
-        status: 'success',
-        meta: {
-          activityKind: 'skill',
-          skillName,
-          compactText: `Skill(${skillName}): 已注入到当前对话。`
-        }
-      })
-    }
-  }
-
-  /**
    * @returns {string}
    */
   function buildPrimedSkillBundle() {
@@ -304,10 +300,11 @@ export function createAgentRuntime(options) {
    * @param {string} text
    * @param {object} [meta]
    * @param {Array<object> | null} [actions]
+   * @param {Array<object>} [availableTools]
    * @returns {void}
    */
-  function pushToolMessage(toolName, status, text, meta = {}, actions = null) {
-    const toolDescription = TOOLS.find(tool => tool.function.name === toolName)?.function?.description || ''
+  function pushToolMessage(toolName, status, text, meta = {}, actions = null, availableTools = TOOLS) {
+    const toolDescription = availableTools.find(tool => tool.function.name === toolName)?.function?.description || ''
     const toolLabel = getToolLabel(toolName, toolDescription)
     const activityKind = toolName === 'load_skill' ? 'skill' : 'tool'
     pushMessage('agent', text, actions, {
@@ -327,6 +324,59 @@ export function createAgentRuntime(options) {
         ...meta
       }
     })
+  }
+
+  /**
+   * @param {object} result
+   * @returns {void}
+   */
+  function cacheLoadedSkill(result) {
+    const skillName = String(result?.skillName || '').trim()
+    const content = String(result?.content || '').trim()
+    if (!result?.ok || !skillName || !content || primedSkillContents.has(skillName)) {
+      return
+    }
+
+    primedSkillContents.set(skillName, content)
+    pushMessage('agent', `Skill(${skillName}): 已注入到当前对话。`, null, {
+      kind: 'skill',
+      status: 'success',
+      meta: {
+        activityKind: 'skill',
+        skillName,
+        compactText: `Skill(${skillName}): 已注入到当前对话。`
+      }
+    })
+  }
+
+  /**
+   * @param {object} effect
+   * @returns {void}
+   */
+  function applyWorkflowEffect(effect) {
+    if (!effect) return
+
+    if (effect.suppressNextAssistantTextMode) {
+      suppressNextAgentTextMode.value = effect.suppressNextAssistantTextMode
+    }
+
+    if (effect.clearInteraction) {
+      clearPendingInteraction()
+    }
+
+    if (effect.interaction) {
+      presentInteraction(effect.interaction, {
+        suppressNextAssistantText: effect.suppressNextAssistantText === true
+      })
+    }
+
+    for (const message of effect.messages || []) {
+      pushMessage('agent', message.text || '', message.actions || null, {
+        kind: message.kind,
+        status: message.status,
+        meta: message.meta
+      })
+    }
   }
 
   /**
@@ -358,16 +408,28 @@ export function createAgentRuntime(options) {
     activeRunId.value = runId
     runAbortController.value = abortController
     agentRunning.value = true
+    clearPendingInteraction()
     suppressNextAgentTextMode.value = ''
+    suppressPendingOnText.value = false
     stopTyping(true)
 
     pushMessage('user', userText)
     agentMessages.value.push({ role: 'user', content: userText })
     let traceSession = null
     let completedAssistantText = null
+    const activeTools = Array.isArray(runOptions.tools) && runOptions.tools.length > 0
+      ? runOptions.tools
+      : TOOLS
+    const workflow = runOptions.workflow || null
 
     try {
-      primeSkills(runOptions.route)
+      const workflowBeforeRunResult = await workflow?.beforeRun?.({
+        userText,
+        ctx,
+        state: getState()
+      })
+      applyWorkflowEffect(workflowBeforeRunResult)
+
       const currentState = getState()
       traceSession = createTraceSession({
         runId,
@@ -384,24 +446,28 @@ export function createAgentRuntime(options) {
         signal,
         state: {
           ...currentState,
+          workflowId: runOptions.route?.workflowId || workflow?.id || currentState.mode || 'general',
+          workflowPrompt: workflow?.promptFragment || '',
+          policy: runOptions.route || null,
+          availableTools: activeTools,
           memorySummary: memories.summary,
           memorySources: memories.sources,
           primedSkillBundle: buildPrimedSkillBundle(),
           primedSkillNames: [...primedSkillContents.keys()],
           traceSession
         },
+        tools: activeTools,
         onEvent(event) {
           if (signal.aborted || isRunStale(runId) || !event?.type) return
 
           if (event.type === 'assistant.delta') {
-            if (suppressNextAgentTextMode.value === 'version-selection') return
+            if (suppressNextAgentTextMode.value === 'interaction') return
             appendAssistantDelta(event.text)
             return
           }
 
           if (event.type === 'assistant.completed') {
-            if (suppressNextAgentTextMode.value === 'version-selection') {
-              suppressNextAgentTextMode.value = ''
+            if (suppressNextAgentTextMode.value === 'interaction') {
               streamingMessageId.value = ''
               return
             }
@@ -411,7 +477,8 @@ export function createAgentRuntime(options) {
         },
         onText(text) {
           if (signal.aborted || isRunStale(runId)) return
-          if (suppressNextAgentTextMode.value === 'version-selection') {
+          if (suppressPendingOnText.value || suppressNextAgentTextMode.value === 'interaction') {
+            suppressPendingOnText.value = false
             suppressNextAgentTextMode.value = ''
             return
           }
@@ -429,11 +496,11 @@ export function createAgentRuntime(options) {
         },
         onToolStart(toolName, args) {
           if (signal.aborted || isRunStale(runId)) return
-          const toolLabel = TOOLS.find(tool => tool.function.name === toolName)?.function?.description || toolName
+          const toolLabel = activeTools.find(tool => tool.function.name === toolName)?.function?.description || toolName
           pushToolMessage(toolName, 'running', `正在执行 ${getToolLabel(toolName, toolLabel)}`, {
             displayResult: buildToolDisplayPayload(toolName, args),
             skillName: toolName === 'load_skill' ? args?.name || '' : ''
-          })
+          }, null, activeTools)
           onToolStart?.({ toolName, args, runId })
         },
         onToolEnd(toolName, result) {
@@ -441,21 +508,35 @@ export function createAgentRuntime(options) {
           const toolStatus = result?.recoverable
             ? 'recovering'
             : result?.error || result?.ok === false ? 'error' : 'success'
-          const summary = result?.summary || (toolStatus === 'success' ? '执行完成' : '执行失败')
-          const followupActions = toolStatus === 'error' ? createRetryActions(toolName) : null
+          const presentation = workflow?.presentToolResult?.({ toolName, result, toolStatus }) || {}
+          const summary = presentation.summary || result?.summary || (toolStatus === 'success' ? '执行完成' : '执行失败')
+          const followupActions = presentation.actions ?? (toolStatus === 'error' ? createRetryActions(toolName) : null)
+
+          if (followupActions?.length) {
+            presentInteraction({
+              id: `interaction-${toolName}-${Date.now()}`,
+              type: 'action-list',
+              title: getActionPromptText(followupActions),
+              description: summary,
+              actions: followupActions,
+              meta: {
+                source: 'tool',
+                toolName
+              }
+            }, {
+              suppressNextAssistantText: true
+            })
+          }
 
           pushToolMessage(toolName, toolStatus, summary, {
             displayResult: buildToolDisplayPayload(toolName, result)
-          }, followupActions)
+          }, null, activeTools)
 
-          if (toolName === 'fetch_jira_versions' && result?.versions?.length) {
-            const versionActions = buildVersionActions(result)
-            pushMessage('agent', getActionPromptText(versionActions), versionActions, {
-              kind: 'notice',
-              status: 'idle'
-            })
-            suppressNextAgentTextMode.value = 'version-selection'
+          if (toolName === 'load_skill') {
+            cacheLoadedSkill(result)
           }
+
+          applyWorkflowEffect(workflow?.afterTool?.({ toolName, result, toolStatus }))
 
           onToolEnd?.({ toolName, result, toolStatus, runId })
         }
@@ -507,7 +588,9 @@ export function createAgentRuntime(options) {
     stopTyping(false)
     streamingMessageId.value = ''
     agentRunning.value = false
+    clearPendingInteraction()
     suppressNextAgentTextMode.value = ''
+    suppressPendingOnText.value = false
 
     if (announce) {
       pushMessage('agent', '已终止当前对话。', null, {
@@ -526,14 +609,19 @@ export function createAgentRuntime(options) {
     agentMessages.value = []
     chatMessages.value = []
     primedSkillContents.clear()
+    clearPendingInteraction()
+    suppressPendingOnText.value = false
   }
 
   return {
     chatMessages,
     agentMessages,
     agentRunning,
+    pendingInteraction,
     primedSkillNames,
     primedSkillBundle,
+    presentInteraction,
+    clearPendingInteraction,
     pushMessage,
     runAgent,
     stopAgentChat,

@@ -10,6 +10,9 @@ vi.mock('../../agent/runtime.js', () => ({
   createAgentRuntime: vi.fn(() => ({
     agentRunning: ref(false),
     chatMessages: ref([]),
+    pendingInteraction: ref(null),
+    presentInteraction: vi.fn(),
+    clearPendingInteraction: vi.fn(),
     pushMessage: vi.fn(),
     runAgent: mockRunAgent,
     stopAgentChat: vi.fn(),
@@ -19,7 +22,7 @@ vi.mock('../../agent/runtime.js', () => ({
 
 import { useReleaseStore } from '../release'
 
-describe('release skill priming', () => {
+describe('release store policy routing', () => {
   beforeEach(() => {
     localStorage.clear()
     setActivePinia(createPinia())
@@ -27,7 +30,7 @@ describe('release skill priming', () => {
     localStorage.setItem('ai_api_key', 'test-key')
   })
 
-  it('primes workspace-topology for admin mapping questions before running the agent', async () => {
+  it('keeps repo mapping questions in the general harness', async () => {
     const release = useReleaseStore()
 
     await release.agentChat('admin 对应哪个仓库')
@@ -37,25 +40,25 @@ describe('release skill priming', () => {
       expect.objectContaining({
         route: expect.objectContaining({
           mode: 'general',
-          intent: 'workspace_mapping',
-          shouldPrimeWorkspaceSkill: true
+          workflowId: 'general',
+          requiresApproval: false
         })
       })
     )
   })
 
-  it('primes workspace-topology for backend mapping questions before running the agent', async () => {
+  it('keeps commit message questions in the general harness', async () => {
     const release = useReleaseStore()
 
-    await release.agentChat('后台系统是哪一个 repo')
+    await release.agentChat('请根据当前本地分支帮我生成 commit message')
 
     expect(mockRunAgent).toHaveBeenCalledWith(
-      '后台系统是哪一个 repo',
+      '请根据当前本地分支帮我生成 commit message',
       expect.objectContaining({
         route: expect.objectContaining({
           mode: 'general',
-          intent: 'workspace_mapping',
-          shouldPrimeWorkspaceSkill: true
+          workflowId: 'general',
+          requiresApproval: false
         })
       })
     )
@@ -71,25 +74,26 @@ describe('release skill priming', () => {
       expect.objectContaining({
         route: expect.objectContaining({
           mode: 'release',
-          intent: 'release_flow',
-          shouldPrimeWorkspaceSkill: false
+          workflowId: 'release',
+          riskLevel: 'high'
         })
       })
     )
   })
 
-  it('primes git-branching for commit message questions before running the agent', async () => {
+  it('marks destructive requests as approval-required before running the agent', async () => {
     const release = useReleaseStore()
 
-    await release.agentChat('请根据当前本地分支帮我生成 commit message')
+    await release.agentChat('请执行 rm -rf node_modules 然后重装依赖')
 
     expect(mockRunAgent).toHaveBeenCalledWith(
-      '请根据当前本地分支帮我生成 commit message',
+      '请执行 rm -rf node_modules 然后重装依赖',
       expect.objectContaining({
         route: expect.objectContaining({
           mode: 'general',
-          intent: 'git_commit_message',
-          primeSkillNames: ['git-branching']
+          workflowId: 'general',
+          riskLevel: 'high',
+          requiresApproval: true
         })
       })
     )

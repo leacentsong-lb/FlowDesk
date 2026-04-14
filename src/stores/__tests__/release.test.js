@@ -15,7 +15,10 @@ describe('release store generic agent mode', () => {
 
     expect(release.mode).toBe('general')
     expect(release.chatMessages[0].text).toContain('开发助手')
-    expect(release.chatMessages[0].actions.map(action => action.id)).toContain('mode-general-workspace')
-    expect(release.chatMessages[0].actions.map(action => action.id)).toContain('mode-release-production')
+    expect(release.pendingInteraction).toMatchObject({
+      title: '选择开始方式'
+    })
+    expect(release.pendingInteraction.actions.map(action => action.id)).toContain('mode-general-workspace')
+    expect(release.pendingInteraction.actions.map(action => action.id)).toContain('mode-release-production')
   })
 })

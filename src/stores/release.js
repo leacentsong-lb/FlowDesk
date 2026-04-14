@@ -7,25 +7,27 @@ import { computed, reactive, ref } from 'vue'
 import { useSettingsStore } from './settings'
 import { useJiraStore } from './jira'
 import { usePromptStore } from './prompt'
-import { TOOLS } from '../agent/index.js'
 import { routeAgentIntent } from '../agent/router.js'
 import { createAgentRuntime } from '../agent/runtime.js'
 import { pushTraceEntry } from '../agent/tracing.js'
+import { getWorkflowTools, resolveAgentWorkflow } from '../agent/workflows/index.js'
 
 export const useReleaseStore = defineStore('release', () => {
   const settings = useSettingsStore()
   const jira = useJiraStore()
   const prompt = usePromptStore()
-  const RELEASE_TOOL_NAMES = new Set([
+  const RELEASE_PIPELINE_TOOLS = [
     'check_credentials',
     'fetch_jira_versions',
     'fetch_version_issues',
     'scan_pr_status',
     'run_preflight',
     'run_build'
-  ])
+  ]
+  const RELEASE_TOOL_NAMES = new Set(RELEASE_PIPELINE_TOOLS)
 
   const mode = ref('general')
+  const currentWorkflowId = ref('general')
   const version = ref('')
   const environment = ref('production')
   const sessionActive = ref(false)
@@ -45,8 +47,14 @@ export const useReleaseStore = defineStore('release', () => {
     }
   }
 
+  function setWorkflow(nextWorkflowId) {
+    const workflow = resolveAgentWorkflow(nextWorkflowId)
+    currentWorkflowId.value = workflow.id
+    setMode(workflow.mode)
+  }
+
   const isReleaseMode = computed(() => mode.value === 'release')
-  const TOOL_ORDER = TOOLS.map(tool => tool.function.name)
+  const TOOL_ORDER = RELEASE_PIPELINE_TOOLS
   const completedTools = computed(() =>
     TOOL_ORDER.filter(name => toolResults[name])
   )
@@ -55,6 +63,7 @@ export const useReleaseStore = defineStore('release', () => {
     ctx: { settings, jira },
     getState: () => ({
       mode: mode.value,
+      workflowId: currentWorkflowId.value,
       version: version.value,
       environment: environment.value,
       workspacePath: settings.workspacePath,
@@ -62,18 +71,15 @@ export const useReleaseStore = defineStore('release', () => {
       promptConfig: prompt.config
     }),
     onToolStart({ toolName, args }) {
-      if (RELEASE_TOOL_NAMES.has(toolName)) {
-        mode.value = 'release'
-        sessionActive.value = true
-      }
-
       if (toolName === 'fetch_version_issues' && args?.version_name) {
         version.value = args.version_name
         sessionActive.value = true
       }
     },
     onToolEnd({ toolName, result }) {
-      toolResults[toolName] = result
+      if (RELEASE_TOOL_NAMES.has(toolName)) {
+        toolResults[toolName] = result
+      }
     },
     onTraceComplete(trace) {
       traces.value = pushTraceEntry(traces.value, trace, 20)
@@ -133,40 +139,56 @@ export const useReleaseStore = defineStore('release', () => {
   async function agentStart() {
     runtime.resetRuntime()
     setMode('general')
-    runtime.pushMessage('agent', '你好，我是开发助手。我可以帮你查看工作区、分析代码、执行工程任务，也可以进入发布流程。', [
-      { id: 'mode-general-workspace', label: '查看工作区', variant: 'primary' },
-      { id: 'mode-general-files', label: '查看目录结构', variant: 'secondary' },
-      { id: 'mode-release-production', label: '开始发布流程', variant: 'ghost' },
-      { id: 'open-settings', label: '前往设置', variant: 'ghost' }
-    ], {
+    runtime.pushMessage('agent', '你好，我是开发助手。我可以帮你查看工作区、分析代码、执行工程任务，也可以进入发布流程。', null, {
       kind: 'notice',
       status: 'idle'
+    })
+    runtime.presentInteraction({
+      id: 'interaction-agent-start',
+      type: 'action-list',
+      title: '选择开始方式',
+      description: '请选择下一步操作。',
+      actions: [
+        { id: 'mode-general-workspace', label: '查看工作区', variant: 'primary' },
+        { id: 'mode-general-files', label: '查看目录结构', variant: 'secondary' },
+        { id: 'mode-release-production', label: '开始发布流程', variant: 'ghost' },
+        { id: 'open-settings', label: '前往设置', variant: 'ghost' }
+      ]
     })
   }
 
   async function agentSelectEnv() {
-    mode.value = 'release'
+    setWorkflow('release')
     environment.value = 'production'
     sessionActive.value = true
+    const workflow = resolveAgentWorkflow('release')
     await runtime.runAgent('发布生产环境，请开始检查凭证并获取版本列表。', {
       route: {
         mode: 'release',
-        intent: 'release_flow',
-        shouldPrimeWorkspaceSkill: false,
-        shouldScanWorkspaceFirst: false
-      }
+        workflowId: 'release',
+        riskLevel: 'high',
+        requiresApproval: false,
+        shouldVerify: true
+      },
+      workflow,
+      tools: getWorkflowTools(workflow.id)
     })
   }
 
   async function runRoutedAgent(userText) {
     const route = routeAgentIntent(userText)
+    const workflow = resolveAgentWorkflow(route.workflowId)
 
-    setMode(route.mode)
-    if (route.mode === 'release') {
+    setWorkflow(workflow.id)
+    if (workflow.id === 'release') {
       sessionActive.value = true
     }
 
-    return runtime.runAgent(userText, { route })
+    return runtime.runAgent(userText, {
+      route,
+      workflow,
+      tools: getWorkflowTools(workflow.id)
+    })
   }
 
   async function agentChat(userText) {
@@ -175,15 +197,24 @@ export const useReleaseStore = defineStore('release', () => {
     }
 
     runtime.pushMessage('user', userText)
-    runtime.pushMessage('agent', '当前未配置 AI，无法回复。请先在 Settings 中配置 AI Provider。', [
-      { id: 'open-settings', label: '前往设置', variant: 'primary' }
-    ], {
+    runtime.pushMessage('agent', '当前未配置 AI，无法回复。请先在 Settings 中配置 AI Provider。', null, {
       kind: 'notice',
       status: 'warning'
+    })
+    runtime.presentInteraction({
+      id: 'interaction-open-settings',
+      type: 'action-list',
+      title: '完成必要配置',
+      description: '请先完成必要配置。',
+      actions: [
+        { id: 'open-settings', label: '前往设置', variant: 'primary' }
+      ]
     })
   }
 
   async function handleChatAction(actionId) {
+    runtime.clearPendingInteraction()
+
     if (actionId === 'open-settings') {
       window.dispatchEvent(new CustomEvent('open-settings', { detail: { tab: 'ai' } }))
       return
@@ -199,7 +230,7 @@ export const useReleaseStore = defineStore('release', () => {
     if (actionId === 'mode-release-production') return agentSelectEnv()
     if (actionId.startsWith('version-')) {
       const selectedVersion = actionId.replace('version-', '')
-      mode.value = 'release'
+      setWorkflow('release')
       version.value = selectedVersion
       sessionActive.value = true
       return runRoutedAgent(`选择版本 ${selectedVersion}，请获取该版本的 issue 列表并继续后续检查。`)
@@ -207,19 +238,24 @@ export const useReleaseStore = defineStore('release', () => {
     if (actionId.startsWith('retry-')) {
       const toolName = actionId.replace('retry-', '')
       delete toolResults[toolName]
+      const workflow = resolveAgentWorkflow('release')
       return runtime.runAgent(`请重新执行 ${toolName}。`, {
         route: {
           mode: 'release',
-          intent: 'release_flow',
-          shouldPrimeWorkspaceSkill: false,
-          shouldScanWorkspaceFirst: false
-        }
+          workflowId: 'release',
+          riskLevel: 'high',
+          requiresApproval: false,
+          shouldVerify: true
+        },
+        workflow,
+        tools: getWorkflowTools(workflow.id)
       })
     }
   }
 
   function resetSession() {
     runtime.resetRuntime()
+    currentWorkflowId.value = 'general'
     mode.value = 'general'
     clearReleaseState()
   }
@@ -227,6 +263,7 @@ export const useReleaseStore = defineStore('release', () => {
   return {
     TOOL_ORDER,
     mode,
+    currentWorkflowId,
     isReleaseMode,
     environment,
     version,
@@ -251,6 +288,7 @@ export const useReleaseStore = defineStore('release', () => {
     buildStatus,
     traces,
     chatMessages: runtime.chatMessages,
+    pendingInteraction: runtime.pendingInteraction,
     primedSkillNames: runtime.primedSkillNames,
     primedSkillBundle: runtime.primedSkillBundle,
     pushMessage: runtime.pushMessage,
