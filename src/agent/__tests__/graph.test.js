@@ -138,4 +138,50 @@ describe('agent graph', () => {
       }
     ])
   })
+
+  it('uses the provided tool subset instead of the global registry when supplied', async () => {
+    const allowedTools = [
+      {
+        type: 'function',
+        function: {
+          name: 'read_file',
+          description: '读取文件',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' }
+            },
+            required: ['path']
+          }
+        }
+      }
+    ]
+
+    streamAgentMock.mockImplementationOnce(async (payload, onEvent) => {
+      expect(payload.tools).toEqual(allowedTools)
+      onEvent({ kind: 'done', finishReason: 'stop' })
+    })
+
+    const result = await runAgentGraph([{ role: 'user', content: '读一下 README' }], {
+      ctx: {
+        settings: {
+          aiConfig: {
+            apiKey: 'test-key',
+            provider: 'openai',
+            model: 'gpt-test'
+          }
+        },
+        jira: {}
+      },
+      state: {
+        mode: 'general',
+        version: '',
+        environment: 'production',
+        completedTools: []
+      },
+      tools: allowedTools
+    })
+
+    expect(result.finalText).toBe('')
+  })
 })

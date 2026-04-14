@@ -12,9 +12,10 @@ describe('agent context', () => {
     })
 
     expect(prompt).toContain('你是开发助手')
-    expect(prompt).toContain('默认优先处理通用工程任务')
-    expect(prompt).toContain('只有在用户明确提到发布')
+    expect(prompt).toContain('默认运行在通用 coding harness 模式')
     expect(prompt).toContain('当前工作区：/Users/demo/workspace')
+    expect(prompt).not.toContain('fetch_jira_versions')
+    expect(prompt).not.toContain('run_preflight')
     expect(prompt).not.toContain('你是 Workspace Agent')
   })
 
@@ -28,25 +29,56 @@ describe('agent context', () => {
     expect(prompt).toContain('当前工作区：/Users/demo/workspace')
   })
 
-  it('tells the agent to load workspace-topology for workspace and repo questions', () => {
+  it('shows only the provided general tool surface by default', () => {
     const prompt = buildSystemPrompt({
-      workspacePath: '/Users/demo/workspace'
+      workspacePath: '/Users/demo/workspace',
+      availableTools: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_file',
+            description: '读取本地文件内容'
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'list_directory',
+            description: '列出目录结构'
+          }
+        }
+      ]
     })
 
-    expect(prompt).toContain('load_skill')
-    expect(prompt).toContain('workspace-topology')
-    expect(prompt).toContain('仓库')
-    expect(prompt).toContain('工作区')
+    expect(prompt).toContain('read_file')
+    expect(prompt).toContain('list_directory')
+    expect(prompt).not.toContain('fetch_jira_versions')
   })
 
-  it('tells the agent to load git-branching for commit message questions', () => {
+  it('shows release tools only when the release workflow is active', () => {
     const prompt = buildSystemPrompt({
-      workspacePath: '/Users/demo/workspace'
+      mode: 'release',
+      workspacePath: '/Users/demo/workspace',
+      availableTools: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_file',
+            description: '读取本地文件内容'
+          }
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'fetch_jira_versions',
+            description: '获取 Jira 未发布版本列表'
+          }
+        }
+      ]
     })
 
-    expect(prompt).toContain('git-branching')
-    expect(prompt).toContain('commit message')
-    expect(prompt).toContain('本地分支')
+    expect(prompt).toContain('获取 Jira 未发布版本列表')
+    expect(prompt).toContain('发布协作模式')
   })
 
   it('tells the release agent to keep replies short when actions are available', () => {
@@ -71,6 +103,17 @@ describe('agent context', () => {
 
   it('registers the workspace-topology built-in skill', () => {
     expect(defaultSkillLoader.list()).toContain('workspace-topology')
+  })
+
+  it('shows loaded skill bundles when available', () => {
+    const prompt = buildSystemPrompt({
+      mode: 'general',
+      workspacePath: '/Users/demo/workspace',
+      primedSkillBundle: '<skill name="git-branching">branch rules</skill>'
+    })
+
+    expect(prompt).toContain('## Primed Skills')
+    expect(prompt).toContain('branch rules')
   })
 
   it('injects memory summary into the system prompt when available', () => {

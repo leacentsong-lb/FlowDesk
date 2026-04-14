@@ -42,6 +42,10 @@ fn main() {
             commands::agent::agent_run_command,
             commands::agent::agent_read_file,
             commands::agent::agent_list_dir,
+            commands::agent::agent_write_file,
+            commands::agent::agent_edit_file,
+            commands::agent::agent_multiedit_file,
+            commands::agent::agent_web_search,
             commands::agent::agent_scan_workspace_repos,
         ])
         .run(tauri::generate_context!())

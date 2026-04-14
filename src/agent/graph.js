@@ -83,6 +83,7 @@ export async function runAgentGraph(messages, options) {
 
 async function runModelNode(graphState, runtimeConfig, options) {
   const { ctx, state, signal } = options
+  const activeTools = resolveActiveTools(options)
   if (signal?.aborted) return {}
 
   const round = Number(graphState.round || 0)
@@ -103,7 +104,7 @@ async function runModelNode(graphState, runtimeConfig, options) {
   }
 
   const fullMessages = [
-    { role: 'system', content: buildSystemPrompt(state) },
+    { role: 'system', content: buildSystemPrompt({ ...state, availableTools: activeTools }) },
     ...workingMessages
   ]
 
@@ -111,7 +112,7 @@ async function runModelNode(graphState, runtimeConfig, options) {
     type: 'model.call',
     round,
     messageCount: fullMessages.length,
-    toolCount: TOOLS.length
+    toolCount: activeTools.length
   })
 
   const response = await streamAgentRound({
@@ -120,7 +121,7 @@ async function runModelNode(graphState, runtimeConfig, options) {
     model: ctx.settings.aiConfig.model,
     provider: ctx.settings.aiConfig.provider || 'openai',
     messages: fullMessages,
-    tools: TOOLS,
+    tools: activeTools,
     signal,
     emit: event => emitGraphEvent(runtimeConfig, event)
   })
@@ -161,6 +162,8 @@ async function runModelNode(graphState, runtimeConfig, options) {
 
 async function runToolsNode(graphState, runtimeConfig, options) {
   const { ctx, state, signal } = options
+  const activeTools = resolveActiveTools(options)
+  const activeToolHandlers = resolveActiveToolHandlers(options, activeTools)
   if (signal?.aborted) return {}
 
   const toolCalls = graphState.lastAssistantMessage?.tool_calls || []
@@ -177,7 +180,7 @@ async function runToolsNode(graphState, runtimeConfig, options) {
 
     const fnName = toolCall.function?.name
     const fnArgs = safeParseArgs(toolCall.function?.arguments)
-    const handler = TOOL_HANDLERS[fnName]
+    const handler = activeToolHandlers[fnName]
 
     recordTraceEvent(state?.traceSession, {
       type: 'tool.start',
@@ -193,7 +196,7 @@ async function runToolsNode(graphState, runtimeConfig, options) {
 
     let output
     try {
-      const validationError = validateToolCall(fnName, fnArgs)
+      const validationError = validateToolCall(fnName, fnArgs, activeTools)
       if (validationError) {
         output = buildRecoverableValidationResult(fnName, validationError)
       } else if (!handler) {
@@ -390,7 +393,7 @@ function safeParseArgs(argsStr) {
   }
 }
 
-function validateToolCall(toolName, args) {
+function validateToolCall(toolName, args, tools) {
   if (!toolName) {
     return {
       code: 'missing_tool_name',
@@ -398,7 +401,7 @@ function validateToolCall(toolName, args) {
     }
   }
 
-  const toolSchema = TOOLS.find(tool => tool.function?.name === toolName)?.function?.parameters
+  const toolSchema = tools.find(tool => tool.function?.name === toolName)?.function?.parameters
   if (!toolSchema) return null
 
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
@@ -417,6 +420,23 @@ function validateToolCall(toolName, args) {
     message: `工具参数无效：${toolName} 缺少必填参数 ${missingFields.join(', ')}`,
     missingFields
   }
+}
+
+function resolveActiveTools(options) {
+  return Array.isArray(options.tools) && options.tools.length > 0
+    ? options.tools
+    : TOOLS
+}
+
+function resolveActiveToolHandlers(options, tools) {
+  if (options.toolHandlers && Object.keys(options.toolHandlers).length > 0) {
+    return options.toolHandlers
+  }
+
+  const allowedNames = new Set(tools.map(tool => tool.function?.name).filter(Boolean))
+  return Object.fromEntries(
+    Object.entries(TOOL_HANDLERS).filter(([toolName]) => allowedNames.has(toolName))
+  )
 }
 
 function buildRecoverableValidationResult(toolName, validationError) {

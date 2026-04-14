@@ -39,7 +39,7 @@ import { runAgentGraph } from './graph.js'
  * @returns {Promise<void>}
  */
 export async function agentLoop(messages, options) {
-  const { ctx, state, onText, onToolStart, onToolEnd, onEvent, signal } = options
+  const { ctx, state, onText, onToolStart, onToolEnd, onEvent, signal, tools, toolHandlers } = options
   const traceSession = state?.traceSession || null
 
   const aiConfig = ctx.settings.aiConfig
@@ -64,6 +64,8 @@ export async function agentLoop(messages, options) {
     const result = await runAgentGraph(messages, {
       ctx,
       state,
+      tools,
+      toolHandlers,
       signal,
       onGraphEvent(event) {
         if (signal?.aborted || !event?.type) return

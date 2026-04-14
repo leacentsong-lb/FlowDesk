@@ -35,3 +35,16 @@ export async function handler(args, _ctx) {
   })
   return result
 }
+
+export const bashSchema = {
+  ...schema,
+  function: {
+    ...schema.function,
+    name: 'bash',
+    description: '执行 shell 命令。默认等待结束；启动 dev server 时可用 background 模式。'
+  }
+}
+
+export async function bashHandler(args, ctx) {
+  return handler(args, ctx)
+}

@@ -12,7 +12,7 @@ describe('prompt store', () => {
     const prompt = usePromptStore()
 
     expect(prompt.config.role.generalIntro).toContain('你是开发助手')
-    expect(prompt.config.workflow.general).toContain('默认优先处理通用工程任务')
+    expect(prompt.config.workflow.general).toContain('默认运行在通用 coding harness 模式')
     expect(prompt.config.responseRules).toContain('用中文回复')
   })
 

@@ -2,6 +2,7 @@ use std::process::{Command, Stdio};
 use std::{fs, path::{Path, PathBuf}};
 use std::thread;
 use std::time::Duration;
+use serde::Deserialize;
 
 /// Run a shell command in a specified directory.
 /// Safety: blocks dangerous patterns and scopes execution to the current workspace.
@@ -74,6 +75,56 @@ fn resolve_command_scope(workspace_path: Option<&str>, cwd: Option<&str>) -> Res
     }
 
     Ok(CommandScope { work_dir })
+}
+
+fn resolve_file_path(workspace_path: Option<&str>, path: &str) -> Result<PathBuf, String> {
+    let workspace = workspace_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Blocked: workspacePath is required for file mutation".to_string())?;
+
+    let workspace_root = fs::canonicalize(workspace)
+        .map_err(|e| format!("Blocked: workspacePath is invalid: {} ({})", workspace, e))?;
+
+    if !workspace_root.is_dir() {
+        return Err(format!("Blocked: workspacePath is not a directory: {}", workspace));
+    }
+
+    let requested = PathBuf::from(path.trim());
+    if requested.as_os_str().is_empty() {
+        return Err("Blocked: file path is required".to_string());
+    }
+
+    let resolved = if requested.is_absolute() {
+        lexical_normalize(&requested)
+    } else {
+        lexical_normalize(&workspace_root.join(requested))
+    };
+
+    if !resolved.starts_with(&workspace_root) {
+        return Err(format!(
+            "Blocked: file path escapes workspace root: {}",
+            workspace_root.to_string_lossy()
+        ));
+    }
+
+    Ok(resolved)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
 }
 
 fn blocked_response(stderr: String) -> serde_json::Value {
@@ -169,9 +220,42 @@ fn build_output_response(
     })
 }
 
+fn apply_exact_edit(content: &str, old_string: &str, new_string: &str, replace_all: bool) -> Result<(String, usize), String> {
+    if old_string.is_empty() {
+        return Err("oldString cannot be empty".to_string());
+    }
+
+    let match_count = content.matches(old_string).count();
+    if match_count == 0 {
+        return Err("oldString not found in file".to_string());
+    }
+
+    if !replace_all && match_count != 1 {
+        return Err(format!("oldString matched {} times; set replaceAll=true to replace all", match_count));
+    }
+
+    let replacements = if replace_all { match_count } else { 1 };
+    let next_content = if replace_all {
+        content.replace(old_string, new_string)
+    } else {
+        content.replacen(old_string, new_string, 1)
+    };
+
+    Ok((next_content, replacements))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{agent_run_command, is_dangerous_command, resolve_command_scope, run_background_command, run_wait_command};
+    use super::{
+        agent_run_command,
+        apply_exact_edit,
+        build_search_queries,
+        extract_duckduckgo_html_results,
+        is_dangerous_command,
+        resolve_command_scope,
+        run_background_command,
+        run_wait_command
+    };
     use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
@@ -306,6 +390,51 @@ mod tests {
             .unwrap_or_default()
             .contains("dangerous command pattern"));
     }
+
+    #[test]
+    fn apply_exact_edit_requires_unique_match_by_default() {
+        let error = apply_exact_edit("hello hello", "hello", "hi", false)
+            .expect_err("should reject ambiguous match");
+
+        assert!(error.contains("matched 2 times"));
+    }
+
+    #[test]
+    fn apply_exact_edit_replaces_all_when_requested() {
+        let (content, replacements) = apply_exact_edit("hello hello", "hello", "hi", true)
+            .expect("should replace all matches");
+
+        assert_eq!(content, "hi hi");
+        assert_eq!(replacements, 2);
+    }
+
+    #[test]
+    fn build_search_queries_adds_compact_cjk_variant() {
+        let queries = build_search_queries("深圳 今天天气");
+
+        assert_eq!(queries[0], "深圳 今天天气");
+        assert!(queries.iter().any(|query| query == "深圳今天天气"));
+    }
+
+    #[test]
+    fn extract_duckduckgo_html_results_parses_serp_markup() {
+        let html = r#"
+        <html><body>
+          <div class="result results_links_deep web-result">
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs">LangGraph Docs</a>
+            <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs">Build stateful agents for LLM workflows.</a>
+          </div>
+        </body></html>
+        "#;
+
+        let results = extract_duckduckgo_html_results(html);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["title"].as_str(), Some("LangGraph Docs"));
+        assert_eq!(results[0]["url"].as_str(), Some("https://example.com/docs"));
+        assert_eq!(results[0]["snippet"].as_str(), Some("Build stateful agents for LLM workflows."));
+        assert_eq!(results[0]["provider"].as_str(), Some("duckduckgo_html"));
+    }
 }
 
 /// Read a file's contents. Returns text content truncated to 50KB.
@@ -385,6 +514,471 @@ pub async fn agent_list_dir(
     })
     .await
     .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+/// Write a full file. Creates parent directories when missing.
+#[tauri::command]
+pub async fn agent_write_file(
+    path: String,
+    content: String,
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolved = resolve_file_path(workspace_path.as_deref(), &path)?;
+
+        if let Some(parent) = resolved.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent directories: {}", e))?;
+        }
+
+        fs::write(&resolved, content.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", resolved.display(), e))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "path": resolved.to_string_lossy().to_string(),
+            "bytes": content.len(),
+            "summary": "文件写入完成。"
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+/// Perform a single exact replacement in a file.
+#[tauri::command]
+pub async fn agent_edit_file(
+    path: String,
+    old_string: String,
+    new_string: String,
+    replace_all: Option<bool>,
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolved = resolve_file_path(workspace_path.as_deref(), &path)?;
+        let content = fs::read_to_string(&resolved)
+            .map_err(|e| format!("Failed to read {}: {}", resolved.display(), e))?;
+
+        let (next_content, replacements) = apply_exact_edit(
+            &content,
+            &old_string,
+            &new_string,
+            replace_all.unwrap_or(false)
+        )?;
+
+        fs::write(&resolved, next_content.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", resolved.display(), e))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "path": resolved.to_string_lossy().to_string(),
+            "replacements": replacements,
+            "summary": format!("已完成 {} 处替换。", replacements)
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFileEdit {
+    old_string: String,
+    new_string: String,
+    replace_all: Option<bool>,
+}
+
+/// Perform multiple exact replacements in sequence.
+#[tauri::command]
+pub async fn agent_multiedit_file(
+    path: String,
+    edits: Vec<AgentFileEdit>,
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolved = resolve_file_path(workspace_path.as_deref(), &path)?;
+        let mut content = fs::read_to_string(&resolved)
+            .map_err(|e| format!("Failed to read {}: {}", resolved.display(), e))?;
+
+        let mut replacements = 0usize;
+        for edit in edits.iter() {
+            let (next_content, count) = apply_exact_edit(
+                &content,
+                &edit.old_string,
+                &edit.new_string,
+                edit.replace_all.unwrap_or(false)
+            )?;
+            content = next_content;
+            replacements += count;
+        }
+
+        fs::write(&resolved, content.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", resolved.display(), e))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "path": resolved.to_string_lossy().to_string(),
+            "replacements": replacements,
+            "summary": format!("已完成 {} 处替换。", replacements)
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+/// Execute a lightweight web search using DuckDuckGo's instant answer API.
+#[tauri::command]
+pub async fn agent_web_search(
+    query: String,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let normalized_query = normalize_search_query(&query);
+    if normalized_query.is_empty() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "query": query,
+            "results": [],
+            "error": "query is required"
+        }));
+    }
+
+    let result_limit = limit.unwrap_or(5).clamp(1, 10);
+    let search_queries = build_search_queries(&normalized_query);
+    let client = reqwest::Client::new();
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut providers: Vec<String> = Vec::new();
+
+    for candidate_query in search_queries.iter() {
+        let instant_results = fetch_duckduckgo_instant_results(&client, candidate_query).await.unwrap_or_default();
+        if !instant_results.is_empty() {
+            providers.push("duckduckgo_instant".to_string());
+            merge_search_results(&mut results, instant_results, result_limit);
+        }
+
+        if results.len() < result_limit {
+            let html_results = fetch_duckduckgo_html_results(&client, candidate_query).await.unwrap_or_default();
+            if !html_results.is_empty() {
+                providers.push("duckduckgo_html".to_string());
+                merge_search_results(&mut results, html_results, result_limit);
+            }
+        }
+
+        if results.len() >= result_limit {
+            break;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "query": query,
+        "normalizedQuery": normalized_query,
+        "provider": if providers.is_empty() {
+            "none".to_string()
+        } else {
+            providers.join("+")
+        },
+        "results": results,
+        "summary": if results.is_empty() {
+            "未找到搜索结果。".to_string()
+        } else {
+            format!("找到 {} 条搜索结果。", results.len())
+        }
+    }))
+}
+
+fn collect_duckduckgo_topics(value: &serde_json::Value, output: &mut Vec<serde_json::Value>) {
+    let Some(items) = value.as_array() else {
+        return;
+    };
+
+    for item in items {
+        if let (Some(text), Some(url)) = (item["Text"].as_str(), item["FirstURL"].as_str()) {
+            output.push(serde_json::json!({
+                "title": summarize_topic_title(text),
+                "url": url,
+                "snippet": text
+            }));
+            continue;
+        }
+
+        collect_duckduckgo_topics(&item["Topics"], output);
+    }
+}
+
+fn summarize_topic_title(text: &str) -> String {
+    let trimmed = text.trim();
+    trimmed
+        .split(" - ")
+        .next()
+        .filter(|part| !part.trim().is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn normalize_search_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn build_search_queries(query: &str) -> Vec<String> {
+    let normalized = normalize_search_query(query);
+    let mut queries = Vec::new();
+
+    push_unique_query(&mut queries, normalized.clone());
+    push_unique_query(&mut queries, trim_search_punctuation(&normalized));
+
+    if contains_cjk(&normalized) && normalized.contains(' ') {
+        push_unique_query(&mut queries, normalized.replace(' ', ""));
+    }
+
+    queries
+}
+
+fn trim_search_punctuation(query: &str) -> String {
+    query
+        .trim_matches(|ch: char| ch.is_whitespace() || "，。！？、,.!?;；:：()（）[]【】“”\"'‘’".contains(ch))
+        .to_string()
+}
+
+fn contains_cjk(input: &str) -> bool {
+    input.chars().any(|ch| {
+        ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+            || ('\u{3400}'..='\u{4DBF}').contains(&ch)
+            || ('\u{3040}'..='\u{30FF}').contains(&ch)
+            || ('\u{AC00}'..='\u{D7AF}').contains(&ch)
+    })
+}
+
+fn push_unique_query(queries: &mut Vec<String>, value: String) {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if !queries.iter().any(|existing| existing == &trimmed) {
+        queries.push(trimmed);
+    }
+}
+
+async fn fetch_duckduckgo_instant_results(
+    client: &reqwest::Client,
+    query: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!(
+        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&no_redirect=1&skip_disambig=0",
+        urlencoding::encode(query)
+    );
+
+    let response = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .header("User-Agent", "flow-desk/1.0")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .send()
+        .await
+        .map_err(|e| format!("Web search failed: {}", e))?;
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse web search response: {}", e))?;
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+
+    if let (Some(abstract_text), Some(abstract_url)) = (
+        payload["AbstractText"].as_str(),
+        payload["AbstractURL"].as_str()
+    ) {
+        if !abstract_text.trim().is_empty() && !abstract_url.trim().is_empty() {
+            results.push(serde_json::json!({
+                "title": payload["Heading"].as_str().filter(|v| !v.trim().is_empty()).unwrap_or("Instant Answer"),
+                "url": abstract_url,
+                "snippet": abstract_text,
+                "provider": "duckduckgo_instant"
+            }));
+        }
+    }
+
+    collect_duckduckgo_topics(&payload["RelatedTopics"], &mut results);
+    for item in results.iter_mut() {
+        if item["provider"].is_null() {
+            item["provider"] = serde_json::Value::String("duckduckgo_instant".to_string());
+        }
+    }
+
+    Ok(results)
+}
+
+async fn fetch_duckduckgo_html_results(
+    client: &reqwest::Client,
+    query: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}&kl=wt-wt",
+        urlencoding::encode(query)
+    );
+
+    let response = client
+        .get(&url)
+        .header("Accept", "text/html")
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .send()
+        .await
+        .map_err(|e| format!("HTML search failed: {}", e))?;
+
+    let html = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read HTML search response: {}", e))?;
+
+    Ok(extract_duckduckgo_html_results(&html))
+}
+
+fn extract_duckduckgo_html_results(html: &str) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(class_idx_rel) = html[cursor..].find("result__a") {
+        let class_idx = cursor + class_idx_rel;
+        let anchor_start = match html[..class_idx].rfind("<a ") {
+            Some(value) => value,
+            None => {
+                cursor = class_idx + "result__a".len();
+                continue;
+            }
+        };
+
+        let href = extract_anchor_href(&html[anchor_start..]).unwrap_or_default();
+        let title = extract_tag_text(&html[anchor_start..], "</a>").unwrap_or_default();
+        let next_anchor = html[class_idx + "result__a".len()..]
+            .find("result__a")
+            .map(|offset| class_idx + "result__a".len() + offset)
+            .unwrap_or(html.len());
+        let snippet_window = &html[class_idx..next_anchor];
+        let snippet = extract_class_text(snippet_window, "result__snippet").unwrap_or_default();
+        let normalized_url = normalize_search_result_url(&href);
+
+        if !title.trim().is_empty() && !normalized_url.trim().is_empty() {
+            results.push(serde_json::json!({
+                "title": decode_html_entities(&title),
+                "url": normalized_url,
+                "snippet": decode_html_entities(&snippet),
+                "provider": "duckduckgo_html"
+            }));
+        }
+
+        cursor = next_anchor;
+    }
+
+    results
+}
+
+fn extract_anchor_href(segment: &str) -> Option<String> {
+    let href_marker = "href=\"";
+    let href_start = segment.find(href_marker)? + href_marker.len();
+    let href_end = segment[href_start..].find('"')? + href_start;
+    Some(segment[href_start..href_end].to_string())
+}
+
+fn extract_tag_text(segment: &str, closing_tag: &str) -> Option<String> {
+    let start = segment.find('>')? + 1;
+    let end = segment[start..].find(closing_tag)? + start;
+    Some(strip_tags(&segment[start..end]))
+}
+
+fn extract_class_text(segment: &str, class_name: &str) -> Option<String> {
+    let class_idx = segment.find(class_name)?;
+    let tag_start = segment[..class_idx].rfind('<')?;
+    let content_start = segment[tag_start..].find('>')? + tag_start + 1;
+
+    for closing_tag in ["</a>", "</span>", "</div>"] {
+        if let Some(content_end_rel) = segment[content_start..].find(closing_tag) {
+            let content_end = content_start + content_end_rel;
+            return Some(strip_tags(&segment[content_start..content_end]));
+        }
+    }
+
+    None
+}
+
+fn strip_tags(value: &str) -> String {
+    let mut output = String::new();
+    let mut inside_tag = false;
+
+    for ch in value.chars() {
+        match ch {
+            '<' => inside_tag = true,
+            '>' => inside_tag = false,
+            _ if !inside_tag => output.push(ch),
+            _ => {}
+        }
+    }
+
+    output.trim().to_string()
+}
+
+fn normalize_search_result_url(url: &str) -> String {
+    let decoded = decode_html_entities(url);
+
+    if let Some(uddg_idx) = decoded.find("uddg=") {
+        let encoded = decoded[uddg_idx + 5..]
+            .split('&')
+            .next()
+            .unwrap_or("");
+
+        if let Ok(value) = urlencoding::decode(encoded) {
+            return value.into_owned();
+        }
+    }
+
+    if decoded.starts_with("//") {
+        return format!("https:{}", decoded);
+    }
+
+    if decoded.starts_with('/') {
+        return format!("https://duckduckgo.com{}", decoded);
+    }
+
+    decoded
+}
+
+fn decode_html_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+fn merge_search_results(
+    target: &mut Vec<serde_json::Value>,
+    candidates: Vec<serde_json::Value>,
+    limit: usize,
+) {
+    for candidate in candidates {
+        if target.len() >= limit {
+            break;
+        }
+
+        let candidate_url = candidate["url"].as_str().unwrap_or("").trim();
+        if candidate_url.is_empty() {
+            continue;
+        }
+
+        if target.iter().any(|item| item["url"].as_str().unwrap_or("") == candidate_url) {
+            continue;
+        }
+
+        target.push(candidate);
+    }
 }
 
 /// Scan a workspace recursively and return detected git repositories.

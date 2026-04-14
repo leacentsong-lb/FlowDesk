@@ -19,9 +19,19 @@ const markdown = new MarkdownIt({
 const DEFAULT_TOOL_LABELS = {
   load_skill: '加载技能',
   run_command: '执行命令',
+  bash: '执行命令',
   read_file: '读取文件',
+  read: '读取文件',
   list_directory: '查看目录',
+  ls: '查看目录',
+  write: '写入文件',
+  edit: '编辑文件',
+  multiedit: '批量编辑文件',
+  glob: '查找文件',
+  grep: '搜索内容',
   scan_workspace_repos: '扫描仓库',
+  todo_write: '更新待办',
+  web_search: '联网搜索',
   check_credentials: '检查凭证',
   fetch_jira_versions: '获取 Jira 版本',
   fetch_version_issues: '获取版本 Issue',
@@ -92,6 +102,22 @@ export function formatJson(value) {
   } catch {
     return String(value ?? '')
   }
+}
+
+/**
+ * @param {string} text
+ * @param {number} [maxLength]
+ * @returns {string}
+ */
+export function summarizeReasoning(text, maxLength = 42) {
+  const normalized = String(text || '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([，。；：、,.!?！？])\s*/g, '$1')
+    .trim()
+
+  if (!normalized) return ''
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
 }
 
 /**

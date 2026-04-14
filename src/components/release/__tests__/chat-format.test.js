@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatCompactToolText, normalizeChatMessage } from '../chat-format.js'
+import { formatCompactToolText, normalizeChatMessage, summarizeReasoning } from '../chat-format.js'
 
 describe('chat format action compression', () => {
   it('compresses long version-selection text when actions are present', () => {
@@ -48,5 +48,13 @@ describe('chat format action compression', () => {
         skillName: 'workspace-topology'
       }
     })).toBe('Skill(workspace-topology): 已加载技能。')
+  })
+
+  it('summarizes reasoning into a compact single-line preview', () => {
+    expect(summarizeReasoning(`
+      先检查当前工作区配置，
+      再确认可用工具，
+      最后决定下一步。
+    `, 18)).toBe('先检查当前工作区配置，再确认可用工…')
   })
 })
