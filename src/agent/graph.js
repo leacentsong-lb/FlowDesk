@@ -1,6 +1,6 @@
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph'
-import { TOOL_HANDLERS, TOOLS } from './tools/index.js'
-import { buildSystemPrompt, estimateTokens, microcompact } from './context.js'
+import { TOOL_HANDLERS, getAllTools } from './tools/index.js'
+import { buildPromptMessages, estimateTokens, microcompact } from './context.js'
 import { aiClient } from '../ai/client.js'
 import { recordTraceEvent } from './tracing.js'
 
@@ -104,15 +104,21 @@ async function runModelNode(graphState, runtimeConfig, options) {
   }
 
   const fullMessages = [
-    { role: 'system', content: buildSystemPrompt({ ...state, availableTools: activeTools }) },
+    ...buildPromptMessages({ ...state, availableTools: activeTools }),
     ...workingMessages
   ]
 
   recordTraceEvent(state?.traceSession, {
     type: 'model.call',
     round,
+    provider: ctx.settings.aiConfig.provider || 'openai',
+    model: ctx.settings.aiConfig.model || '',
     messageCount: fullMessages.length,
-    toolCount: activeTools.length
+    toolCount: activeTools.length,
+    request: {
+      messages: fullMessages,
+      tools: activeTools
+    }
   })
 
   const response = await streamAgentRound({
@@ -123,7 +129,13 @@ async function runModelNode(graphState, runtimeConfig, options) {
     messages: fullMessages,
     tools: activeTools,
     signal,
-    emit: event => emitGraphEvent(runtimeConfig, event)
+    emit: event => emitGraphEvent(runtimeConfig, event),
+    onNetworkEvent: event => {
+      recordTraceEvent(state?.traceSession, {
+        ...event,
+        round
+      })
+    }
   })
 
   const choice = response?.choices?.[0]
@@ -197,8 +209,17 @@ async function runToolsNode(graphState, runtimeConfig, options) {
     let output
     try {
       const validationError = validateToolCall(fnName, fnArgs, activeTools)
+      const guardResult = validationError
+        ? null
+        : await options.beforeToolCall?.({
+          toolName: fnName,
+          args: fnArgs,
+          state
+        })
       if (validationError) {
         output = buildRecoverableValidationResult(fnName, validationError)
+      } else if (guardResult?.result) {
+        output = guardResult.result
       } else if (!handler) {
         output = { error: `Unknown tool: ${fnName}` }
       } else {
@@ -267,7 +288,7 @@ function emitGraphEvent(runtimeConfig, event) {
 }
 
 async function streamAgentRound(options) {
-  const { apiKey, baseUrl, model, provider, messages, tools, signal, emit } = options
+  const { apiKey, baseUrl, model, provider, messages, tools, signal, emit, onNetworkEvent } = options
   const toolCallDrafts = []
   let content = ''
   let reasoningContent = ''
@@ -323,7 +344,9 @@ async function streamAgentRound(options) {
       finishReason = String(payload.finishReason || finishReason || 'stop')
       done = true
     }
-  }, signal)
+  }, signal, {
+    onNetworkEvent
+  })
 
   if (!done) {
     throw new Error('AI stream ended unexpectedly')
@@ -425,7 +448,7 @@ function validateToolCall(toolName, args, tools) {
 function resolveActiveTools(options) {
   return Array.isArray(options.tools) && options.tools.length > 0
     ? options.tools
-    : TOOLS
+    : getAllTools()
 }
 
 function resolveActiveToolHandlers(options, tools) {

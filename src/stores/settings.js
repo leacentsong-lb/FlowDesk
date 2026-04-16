@@ -11,6 +11,10 @@ const DEFAULT_AI_CONFIG = {
   organization: '',
   project: ''
 }
+const DEFAULT_SEARCH_CONFIG = {
+  provider: 'tavily',
+  apiKey: ''
+}
 
 const BROKER_REPO_NAMES = {
   tmgm: 'TMGM-CRM-Member-Frontend',
@@ -38,9 +42,15 @@ const loadAiConfig = () => ({
   project: localStorage.getItem('ai_project') || DEFAULT_AI_CONFIG.project
 })
 
+const loadSearchConfig = () => ({
+  provider: localStorage.getItem('search_provider') || DEFAULT_SEARCH_CONFIG.provider,
+  apiKey: localStorage.getItem('search_api_key') || DEFAULT_SEARCH_CONFIG.apiKey
+})
+
 export const useSettingsStore = defineStore('settings', () => {
   const workspacePath = ref(loadWorkspacePath())
   const aiConfig = reactive(loadAiConfig())
+  const searchConfig = reactive(loadSearchConfig())
 
   const brokerPaths = computed(() => {
     const base = workspacePath.value || DEFAULT_WORKSPACE_PATH
@@ -82,6 +92,23 @@ export const useSettingsStore = defineStore('settings', () => {
 
   const aiConfigured = computed(() => !!(aiConfig.apiKey || '').trim())
 
+  function saveSearchConfig() {
+    localStorage.setItem('search_provider', searchConfig.provider || DEFAULT_SEARCH_CONFIG.provider)
+    localStorage.setItem('search_api_key', (searchConfig.apiKey || '').trim())
+  }
+
+  function updateSearchConfig(newConfig) {
+    Object.assign(searchConfig, newConfig)
+    saveSearchConfig()
+  }
+
+  function resetSearchConfig() {
+    Object.assign(searchConfig, DEFAULT_SEARCH_CONFIG)
+    saveSearchConfig()
+  }
+
+  const searchConfigured = computed(() => !!(searchConfig.apiKey || '').trim())
+
   // ============================================
   // GitHub Token
   // ============================================
@@ -112,6 +139,11 @@ export const useSettingsStore = defineStore('settings', () => {
     saveAiConfig,
     updateAiConfig,
     resetAiConfig,
+    searchConfig,
+    searchConfigured,
+    saveSearchConfig,
+    updateSearchConfig,
+    resetSearchConfig,
     githubToken,
     githubTokenSaved,
     saveGithubToken,

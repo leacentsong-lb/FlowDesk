@@ -30,6 +30,6 @@
  */
 
 export { agentLoop } from './loop.js'
-export { TOOL_HANDLERS, TOOLS } from './tools/index.js'
+export { TOOL_HANDLERS, TOOLS, getAllTools, getToolsByTags, getToolCatalogEntry } from './tools/index.js'
 export { buildSystemPrompt, estimateTokens, microcompact } from './context.js'
-export { SkillLoader, defaultSkillLoader } from './skills.js'
+export { SkillLoader, defaultSkillLoader, getEditableAppSkills } from './skills.js'

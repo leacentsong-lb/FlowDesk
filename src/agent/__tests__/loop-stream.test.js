@@ -12,11 +12,13 @@ vi.mock('../../ai/client.js', () => ({
 
 vi.mock('../tools/index.js', () => ({
   TOOL_HANDLERS: {},
+  getAllTools: () => [],
   TOOLS: []
 }))
 
 vi.mock('../context.js', () => ({
   buildSystemPrompt: vi.fn(() => 'system prompt'),
+  buildPromptMessages: vi.fn(() => [{ role: 'system', content: 'system prompt' }]),
   microcompact: vi.fn(),
   estimateTokens: vi.fn(() => 0)
 }))

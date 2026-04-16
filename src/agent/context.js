@@ -20,73 +20,56 @@ import { getToolsByTags } from './tools/index.js'
  * @returns {string} System prompt.
  */
 export function buildSystemPrompt(state = {}) {
+  return buildPromptMessages(state)
+    .map(message => String(message.content || '').trim())
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+/**
+ * Build prompt messages with a stable prefix and a volatile runtime tail.
+ *
+ * @param {object} state
+ * @returns {Array<{ role: 'system', content: string }>}
+ */
+export function buildPromptMessages(state = {}) {
   const promptConfig = normalizePromptConfig(state.promptConfig)
   const mode = state.mode || 'general'
-  const workflowId = state.workflowId || mode
-  const version = state.version || '未选择'
-  const env = state.environment || '未选择'
-  const workspacePath = state.workspacePath || '未设置'
-  const memorySummary = String(state.memorySummary || '').trim()
-  const memorySection = memorySummary ? `## Memory\n\n${memorySummary}` : '## Memory\n\n(no memory loaded)'
-  const primedSkillBundle = String(state.primedSkillBundle || '').trim()
-  const primedSkillSection = primedSkillBundle ? `## Primed Skills\n\n${primedSkillBundle}` : '## Primed Skills\n\n(no primed skills)'
-  const completed = state.completedTools || []
-  const availableTools = resolveAvailableTools(state)
   const roleIntro = mode === 'release'
     ? promptConfig.role.releaseIntro
     : promptConfig.role.generalIntro
   const workflowGuidance = mode === 'release'
     ? promptConfig.workflow.release
     : promptConfig.workflow.general
-  const workflowPrompt = String(state.workflowPrompt || '').trim()
-  const policyLines = buildPolicyLines(state.policy)
   const specialRules = promptConfig.specialRules.map(rule => `- ${rule}`).join('\n')
   const responseRules = promptConfig.responseRules.map(rule => `- ${rule}`).join('\n')
-  const toolSummary = formatToolSummary(availableTools)
 
-  return [
+  const stablePrompt = [
     roleIntro,
-    '',
-    '## Tool Surface',
-    '',
-    toolSummary,
-    '',
-    '## Skills（可加载的专业知识）',
-    '',
-    `可用技能：${defaultSkillLoader.list().join('、')}`,
-    '',
-    promptConfig.skillPolicyIntro,
-    '',
-    '## Policy',
-    '',
-    policyLines,
-    '',
-    '特别规则：',
-    specialRules,
-    '',
-    memorySection,
-    '',
-    primedSkillSection,
     '',
     '## 工作方式',
     '',
     workflowGuidance,
-    workflowPrompt ? '' : null,
-    workflowPrompt || null,
     '',
-    '## 当前状态',
+    '## Skills 使用策略',
     '',
-    `- 当前模式：${mode}`,
-    `- 当前工作流：${workflowId}`,
-    `- 目标环境：${env}`,
-    `- 选定版本：${version}`,
-    `- 当前工作区：${workspacePath}`,
-    `- 已完成步骤：${completed.length > 0 ? completed.join(', ') : '无'}`,
+    promptConfig.skillPolicyIntro,
+    '',
+    '## 特别规则',
+    '',
+    specialRules,
     '',
     '## 回复规则',
     '',
     responseRules
   ].filter(Boolean).join('\n')
+
+  const dynamicPrompt = buildDynamicRuntimePrompt(state)
+
+  return [
+    { role: 'system', content: stablePrompt },
+    { role: 'system', content: dynamicPrompt }
+  ]
 }
 
 /**
@@ -151,6 +134,57 @@ function resolveAvailableTools(state) {
     : getToolsByTags(['base'])
 }
 
+function buildDynamicRuntimePrompt(state = {}) {
+  const mode = state.mode || 'general'
+  const workflowId = state.workflowId || mode
+  const version = state.version || '未选择'
+  const env = state.environment || '未选择'
+  const workspacePath = state.workspacePath || '未设置'
+  const completed = state.completedTools || []
+  const availableTools = resolveAvailableTools(state)
+  const workflowPrompt = String(state.workflowPrompt || '').trim()
+  const policyLines = buildPolicyLines(state.policy)
+  const releaseSessionLines = buildReleaseSessionLines(state.releaseSession, state.currentGate)
+  const toolSummary = formatToolSummary(availableTools)
+  const memorySummary = String(state.memorySummary || '').trim()
+  const memorySection = memorySummary ? `## Memory\n\n${memorySummary}` : '## Memory\n\n(no memory loaded)'
+  const primedSkillBundle = String(state.primedSkillBundle || '').trim()
+  const primedSkillSection = primedSkillBundle ? `## Primed Skills\n\n${primedSkillBundle}` : '## Primed Skills\n\n(no primed skills)'
+  const skillDirectory = defaultSkillLoader.promptIndex()
+
+  return [
+    '## Tool Surface',
+    '',
+    toolSummary,
+    '',
+    '## Skills（可按需加载）',
+    '',
+    skillDirectory,
+    '',
+    '## Policy',
+    '',
+    policyLines,
+    '',
+    workflowPrompt ? '## Workflow Context' : null,
+    workflowPrompt ? '' : null,
+    workflowPrompt || null,
+    '',
+    '## 当前状态',
+    '',
+    `- 当前模式：${mode}`,
+    `- 当前工作流：${workflowId}`,
+    `- 目标环境：${env}`,
+    `- 选定版本：${version}`,
+    `- 当前工作区：${workspacePath}`,
+    `- 已完成步骤：${completed.length > 0 ? completed.join(', ') : '无'}`,
+    ...releaseSessionLines,
+    '',
+    memorySection,
+    '',
+    primedSkillSection
+  ].filter(Boolean).join('\n')
+}
+
 /**
  * @param {Array<object>} tools
  * @returns {string}
@@ -181,6 +215,33 @@ function buildPolicyLines(policy = {}) {
   return [
     `- 风险等级：${riskLevel}`,
     `- 是否需要审批：${requiresApproval}`,
-    `- 是否建议在执行后做验证：${shouldVerify}`
+    `- 是否建议在执行后做验证：${shouldVerify}`,
+    '- 对于 release workflow 中的危险步骤，若未看到已授权状态，禁止继续执行。'
   ].join('\n')
+}
+
+/**
+ * @param {object} session
+ * @param {object} gate
+ * @returns {string[]}
+ */
+function buildReleaseSessionLines(session, gate) {
+  if (!session?.steps) {
+    return []
+  }
+
+  const blockedSteps = (session.blockedSteps || []).join(', ') || '无'
+  const pendingApprovals = (session.approvals || [])
+    .filter(approval => approval.decision === 'pending')
+    .map(approval => approval.stepId)
+    .join(', ') || '无'
+
+  return [
+    `- Release Session：${session.sessionId || '未创建'}`,
+    `- Release 状态：${session.status || 'draft'}`,
+    `- 当前步骤：${session.currentStepId || '无'}`,
+    `- 阻塞步骤：${blockedSteps}`,
+    `- 待审批步骤：${pendingApprovals}`,
+    gate?.stepId ? `- 当前审批闸门：${gate.stepId}` : '- 当前审批闸门：无'
+  ]
 }

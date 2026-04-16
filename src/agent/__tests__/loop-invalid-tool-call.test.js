@@ -17,6 +17,36 @@ vi.mock('../tools/index.js', () => ({
     run_command: runCommandMock,
     read_file: readFileMock
   },
+  getAllTools: () => [
+    {
+      type: 'function',
+      function: {
+        name: 'run_command',
+        description: '执行 shell 命令',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' }
+          },
+          required: ['command']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: '读取本地文件内容',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' }
+          },
+          required: ['path']
+        }
+      }
+    }
+  ],
   TOOLS: [
     {
       type: 'function',
@@ -51,6 +81,7 @@ vi.mock('../tools/index.js', () => ({
 
 vi.mock('../context.js', () => ({
   buildSystemPrompt: vi.fn(() => 'system prompt'),
+  buildPromptMessages: vi.fn(() => [{ role: 'system', content: 'system prompt' }]),
   microcompact: vi.fn(),
   estimateTokens: vi.fn(() => 0)
 }))

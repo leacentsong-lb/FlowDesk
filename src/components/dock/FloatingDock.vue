@@ -28,6 +28,16 @@ const emit = defineEmits(['openSettings', 'navigate'])
           <svg class="dock-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
           <span class="dock-label">Dev</span>
         </button>
+
+        <button
+          class="dock-item"
+          :class="{ active: currentView === 'tools' }"
+          title="工具"
+          @click="emit('navigate', 'tools')"
+        >
+          <svg class="dock-svg-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.1-3.1a6 6 0 0 1-7.6 7.6l-6.9 6.9a2 2 0 1 1-2.8-2.8l6.9-6.9a6 6 0 0 1 7.6-7.6z"/></svg>
+          <span class="dock-label">Tools</span>
+        </button>
         
         <button
           class="dock-item"

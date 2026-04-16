@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useReleaseStore } from '../../stores/release'
+import { RELEASE_STEP_ORDER } from '../../agent/workflows/release-session.js'
 
 const release = useReleaseStore()
 const expandedStep = ref(null)
@@ -12,19 +13,15 @@ function toggleStep(step) {
 }
 
 function stepStatus(step) {
-  const toolName = STEPS[step]?.tool
-  if (!toolName) return step <= release.currentStep ? 'done' : 'pending'
+  const stepId = STEPS[step]?.id
+  const sessionStep = release.releaseSession?.steps?.[stepId]
+  const status = sessionStep?.status || 'pending'
 
-  const result = release.toolResults[toolName]
-  if (!result) {
-    if (step === release.currentStep) return 'active'
-    if (step > release.currentStep) return 'pending'
-    return 'pending'
-  }
-
-  if (result.error || result.ok === false) return 'blocked'
-  if (result.ok) return 'done'
-  return 'active'
+  if (status === 'done') return 'done'
+  if (status === 'blocked') return 'blocked'
+  if (status === 'awaiting_approval') return 'blocked'
+  if (status === 'waiting_input' || (release.releaseSession?.currentStepId === stepId && status === 'pending')) return 'active'
+  return 'pending'
 }
 
 function statusLabel(val) {
@@ -40,12 +37,12 @@ function openUrl(url) {
 }
 
 const STEPS = [
-  { id: 0, label: '凭证检查', tool: 'check_credentials' },
-  { id: 1, label: '版本列表', tool: 'fetch_jira_versions' },
-  { id: 2, label: '发布预览', tool: 'fetch_version_issues' },
-  { id: 3, label: 'PR 检查', tool: 'scan_pr_status' },
-  { id: 4, label: '发布预检', tool: 'run_preflight' },
-  { id: 5, label: '构建验证', tool: 'run_build' }
+  ...RELEASE_STEP_ORDER.map((step, index) => ({
+    id: step.id,
+    order: index,
+    label: step.label,
+    tool: step.toolName
+  }))
 ]
 </script>
 
@@ -56,32 +53,48 @@ const STEPS = [
       <span class="panel-title">Release Pipeline</span>
       <span v-if="release.version" class="panel-version">v{{ release.version }}</span>
     </div>
+    <div class="panel-meta">
+      <span class="meta-pill">{{ release.releaseSession?.status || 'draft' }}</span>
+      <span v-if="release.currentGate" class="meta-pill danger">审批中: {{ release.currentGate.stepId }}</span>
+      <span class="meta-pill">产物 {{ release.releaseArtifacts.length }}</span>
+    </div>
 
     <div class="steps-list">
       <div
         v-for="step in STEPS"
-        :key="step.id"
+        :key="step.order"
         class="step-item"
-        :class="stepStatus(step.id)"
+        :class="stepStatus(step.order)"
       >
-        <button class="step-row" @click="toggleStep(step.id)">
-          <span class="step-dot" :class="stepStatus(step.id)"></span>
-          <span class="step-connector" v-if="step.id < STEPS.length - 1"></span>
+        <button class="step-row" @click="toggleStep(step.order)">
+          <span class="step-dot" :class="stepStatus(step.order)"></span>
+          <span class="step-connector" v-if="step.order < STEPS.length - 1"></span>
           <span class="step-name">{{ step.label }}</span>
-          <span v-if="stepStatus(step.id) === 'active'" class="step-active-indicator"></span>
+          <span v-if="stepStatus(step.order) === 'active'" class="step-active-indicator"></span>
           <svg
-            v-if="step.id <= release.currentStep"
+            v-if="step.order <= release.currentStep || release.releaseSession?.steps?.[step.id]?.status"
             class="step-chevron"
-            :class="{ open: expandedStep === step.id }"
+            :class="{ open: expandedStep === step.order }"
             width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
           ><polyline points="6 9 12 15 18 9"/></svg>
         </button>
 
         <!-- Expanded detail -->
-        <div v-if="expandedStep === step.id && step.id <= release.currentStep" class="step-detail">
+        <div v-if="expandedStep === step.order" class="step-detail">
+          <div class="detail-row">
+            <span class="detail-label">状态</span>
+            <span class="detail-value" :class="{ ok: stepStatus(step.order) === 'done' }">
+              {{ release.releaseSession?.steps?.[step.id]?.status || 'pending' }}
+            </span>
+          </div>
+
+          <div v-if="release.releaseSession?.steps?.[step.id]?.summary" class="detail-row">
+            <span class="detail-label">摘要</span>
+            <span class="detail-value">{{ release.releaseSession.steps[step.id].summary }}</span>
+          </div>
 
           <!-- Step 0: Credentials -->
-          <template v-if="step.id === 0">
+          <template v-if="step.id === 'credentials'">
             <div class="detail-row">
               <span class="detail-label">Jira</span>
               <span class="detail-value" :class="{ ok: release.credentials.jira }">{{ release.credentials.jira ? '已就绪' : '未配置' }}</span>
@@ -104,7 +117,7 @@ const STEPS = [
           </template>
 
           <!-- Step 1: Version list -->
-          <template v-if="step.id === 1 && release.version">
+          <template v-if="step.id === 'versionSelection' && release.version">
             <div class="detail-row">
               <span class="detail-label">已选版本</span>
               <span class="detail-value mono ok">v{{ release.version }}</span>
@@ -112,7 +125,7 @@ const STEPS = [
           </template>
 
           <!-- Step 2: Issues detail -->
-          <template v-if="step.id === 2 && release.versionIssues.length > 0">
+          <template v-if="step.id === 'jiraIssues' && release.versionIssues.length > 0">
             <div class="detail-issues">
               <div
                 v-for="issue in release.versionIssues"
@@ -128,7 +141,7 @@ const STEPS = [
           </template>
 
           <!-- Step 3: PR results detail -->
-          <template v-if="step.id === 3 && release.prCheckResults.length > 0">
+          <template v-if="step.id === 'prStatus' && release.prCheckResults.length > 0">
             <div
               v-for="pr in release.prCheckResults"
               :key="`${pr.repo}-${pr.prNumber}`"
@@ -143,7 +156,7 @@ const STEPS = [
           </template>
 
           <!-- Step 4: Preflight detail -->
-          <template v-if="step.id === 4 && release.preflightResults.length > 0">
+          <template v-if="step.id === 'preflight' && release.preflightResults.length > 0">
             <div v-for="repo in release.preflightResults" :key="repo.repoKey" class="preflight-mini">
               <div class="preflight-mini-header">{{ repo.repoKey }}</div>
               <div
@@ -158,8 +171,24 @@ const STEPS = [
             </div>
           </template>
 
-          <!-- Step 5: Build detail -->
-          <template v-if="step.id === 5 && release.buildResults.length > 0">
+          <template v-if="step.id === 'configChanges' && release.configChanges.length > 0">
+            <div v-for="change in release.configChanges" :key="change.repoKey" class="preflight-mini">
+              <div class="preflight-mini-header">{{ change.repoKey }}</div>
+              <div v-for="file in change.files" :key="file" class="detail-row">
+                <span class="detail-value mono">{{ file }}</span>
+              </div>
+            </div>
+          </template>
+
+          <template v-if="step.id === 'i18nArtifacts' && release.i18nArtifacts.length > 0">
+            <div v-for="artifact in release.i18nArtifacts" :key="artifact.path || artifact.title" class="detail-row">
+              <span class="detail-label">{{ artifact.kind || 'artifact' }}</span>
+              <span class="detail-value mono">{{ artifact.path || artifact.title }}</span>
+            </div>
+          </template>
+
+          <!-- Build detail -->
+          <template v-if="(step.id === 'buildVerification' || step.id === 'run_build') && release.buildResults.length > 0">
             <div v-for="build in release.buildResults" :key="build.repoKey">
               <div class="detail-row" :class="{ blocked: !build.ok }">
                 <span class="detail-label">{{ build.repoKey }}</span>
@@ -170,6 +199,13 @@ const STEPS = [
                 </button>
               </div>
               <pre v-if="expandedBuildLog === build.repoKey" class="build-log-mini">{{ build.stderr || build.stdout || '(no output)' }}</pre>
+            </div>
+          </template>
+
+          <template v-if="step.id === 'confluenceDraft' || step.id === 'confluencePublish'">
+            <div v-for="artifact in release.releaseArtifacts.filter(item => item.stepId === step.id)" :key="artifact.path || artifact.title" class="detail-row">
+              <span class="detail-label">{{ artifact.kind }}</span>
+              <span class="detail-value mono">{{ artifact.path || artifact.title }}</span>
             </div>
           </template>
         </div>
@@ -194,6 +230,32 @@ const STEPS = [
   border-bottom: 1px solid var(--glass-border);
   color: var(--text-primary);
   flex-shrink: 0;
+}
+
+.panel-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 16px 0;
+}
+
+.meta-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-secondary) 90%, transparent);
+  border: 1px solid var(--glass-border);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.meta-pill.danger {
+  color: var(--error);
+  border-color: var(--error-border);
+  background: color-mix(in srgb, var(--error) 8%, transparent);
 }
 
 .panel-title {

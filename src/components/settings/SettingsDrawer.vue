@@ -88,6 +88,7 @@ const handleProviderChange = () => {
 
 const handleSaveAiConfig = () => {
   settings.saveAiConfig()
+  settings.saveSearchConfig()
 }
 
 const formatAiErrorBody = (body) => {
@@ -386,6 +387,38 @@ watch(
                   class="config-input"
                   placeholder="proj_..."
                 />
+              </div>
+
+              <div class="section-header nested-section-header">
+                <h4>Web Search 配置</h4>
+                <button class="reset-btn" @click="settings.resetSearchConfig" title="重置搜索配置">🔄 重置</button>
+              </div>
+
+              <div class="form-group">
+                <label>Search Provider</label>
+                <select data-testid="search-provider-select" v-model="settings.searchConfig.provider" class="config-input">
+                  <option value="tavily">Tavily</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label>
+                  Search API Key
+                  <a href="https://app.tavily.com/home" target="_blank" class="help-link">获取 Tavily Key</a>
+                </label>
+                <input
+                  data-testid="search-api-key-input"
+                  v-model="settings.searchConfig.apiKey"
+                  type="password"
+                  class="config-input"
+                  placeholder="tvly-..."
+                />
+                <p class="input-hint">`web_search` 会优先使用这里配置的真实搜索 provider；未配置时只会退回弱搜索兜底。</p>
+              </div>
+
+              <div class="token-status" :class="{ configured: settings.searchConfigured }">
+                <span v-if="settings.searchConfigured" class="status-indicator success">✅ Web Search 已配置</span>
+                <span v-else class="status-indicator warning">⚠️ 尚未配置 Search API Key</span>
               </div>
 
               <div class="token-status" :class="{ configured: settings.aiConfigured }">

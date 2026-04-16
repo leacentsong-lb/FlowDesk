@@ -9,7 +9,7 @@
  * - soft cancellation via AbortController + runId
  */
 import { computed, ref } from 'vue'
-import { agentLoop, TOOLS } from './index.js'
+import { agentLoop, getAllTools } from './index.js'
 import { loadAgentMemories } from './memory.js'
 import { createTraceSession, finalizeTrace, snapshotTrace } from './tracing.js'
 import {
@@ -25,11 +25,13 @@ import {
  * @param {() => object} options.getState
  * @param {(event: { toolName: string, args: object, runId: string }) => void} [options.onToolStart]
  * @param {(event: { toolName: string, result: unknown, toolStatus: string, runId: string }) => void} [options.onToolEnd]
+ * @param {(trace: object) => void} [options.onTraceUpdate]
  * @param {(trace: object) => void} [options.onTraceComplete]
+ * @param {(event: { toolName: string, args: object, state: object, workflow: object | null }) => Promise<object | null> | object | null} [options.beforeToolCall]
  * @returns {object}
  */
 export function createAgentRuntime(options) {
-  const { ctx, getState, onToolStart, onToolEnd, onTraceComplete } = options
+  const { ctx, getState, onToolStart, onToolEnd, onTraceUpdate, onTraceComplete, beforeToolCall } = options
 
   const chatMessages = ref([])
   const agentMessages = ref([])
@@ -43,6 +45,7 @@ export function createAgentRuntime(options) {
   const typingMessageId = ref('')
   const typingFullText = ref('')
   const streamingMessageId = ref('')
+  const toolMessageIds = ref({})
   const primedSkillContents = new Map()
   const primedSkillNames = computed(() => [...primedSkillContents.keys()])
   const primedSkillBundle = computed(() => buildPrimedSkillBundle())
@@ -303,24 +306,72 @@ export function createAgentRuntime(options) {
    * @param {Array<object>} [availableTools]
    * @returns {void}
    */
-  function pushToolMessage(toolName, status, text, meta = {}, actions = null, availableTools = TOOLS) {
+  function pushToolMessage(toolName, status, text, meta = {}, actions = null, availableTools = getAllTools()) {
     const toolDescription = availableTools.find(tool => tool.function.name === toolName)?.function?.description || ''
     const toolLabel = getToolLabel(toolName, toolDescription)
     const activityKind = toolName === 'load_skill' ? 'skill' : 'tool'
+    const compactText = formatCompactToolText({
+      toolName,
+      status,
+      toolLabel,
+      summary: text,
+      meta
+    })
+    const nextHistoryItem = {
+      status,
+      text,
+      ts: new Date().toISOString()
+    }
+    const existingMessageId = toolMessageIds.value[toolName]
+    const existingMessage = existingMessageId
+      ? chatMessages.value.find(message => message.id === existingMessageId)
+      : null
+
+    if (existingMessage) {
+      const previousHistory = Array.isArray(existingMessage.meta?.statusHistory)
+        ? existingMessage.meta.statusHistory
+        : []
+      const shouldAppendHistory = previousHistory.length === 0 || (
+        previousHistory[previousHistory.length - 1].status !== nextHistoryItem.status ||
+        previousHistory[previousHistory.length - 1].text !== nextHistoryItem.text
+      )
+      const statusHistory = shouldAppendHistory
+        ? [...previousHistory, nextHistoryItem]
+        : previousHistory
+
+      updateMessage(existingMessage.id, {
+        text,
+        actions,
+        kind: 'tool',
+        status,
+        meta: {
+          ...(existingMessage.meta || {}),
+          activityKind,
+          toolName,
+          toolLabel,
+          compactText,
+          statusHistory,
+          ...meta
+        }
+      })
+      return
+    }
+
+    const messageId = `${Date.now()}-${Math.random()}`
+    toolMessageIds.value = {
+      ...toolMessageIds.value,
+      [toolName]: messageId
+    }
     pushMessage('agent', text, actions, {
+      id: messageId,
       kind: 'tool',
       status,
       meta: {
         activityKind,
         toolName,
         toolLabel,
-        compactText: formatCompactToolText({
-          toolName,
-          status,
-          toolLabel,
-          summary: text,
-          meta
-        }),
+        compactText,
+        statusHistory: [nextHistoryItem],
         ...meta
       }
     })
@@ -413,13 +464,13 @@ export function createAgentRuntime(options) {
     suppressPendingOnText.value = false
     stopTyping(true)
 
-    pushMessage('user', userText)
+    pushMessage('user', runOptions.displayUserText || userText)
     agentMessages.value.push({ role: 'user', content: userText })
     let traceSession = null
     let completedAssistantText = null
     const activeTools = Array.isArray(runOptions.tools) && runOptions.tools.length > 0
       ? runOptions.tools
-      : TOOLS
+      : getAllTools()
     const workflow = runOptions.workflow || null
 
     try {
@@ -435,7 +486,11 @@ export function createAgentRuntime(options) {
         runId,
         mode: currentState.mode,
         workspacePath: currentState.workspacePath,
-        userText
+        userText,
+        workflowId: runOptions.route?.workflowId || workflow?.id || currentState.workflowId || currentState.mode || 'general',
+        provider: ctx.settings.aiConfig.provider || 'openai',
+        model: ctx.settings.aiConfig.model || '',
+        notify: trace => onTraceUpdate?.(trace)
       })
       const memories = await loadAgentMemories({
         workspacePath: currentState.workspacePath
@@ -457,6 +512,14 @@ export function createAgentRuntime(options) {
           traceSession
         },
         tools: activeTools,
+        beforeToolCall(event) {
+          if (signal.aborted || isRunStale(runId)) return null
+          return beforeToolCall?.({
+            ...event,
+            state: getState(),
+            workflow
+          }) || null
+        },
         onEvent(event) {
           if (signal.aborted || isRunStale(runId) || !event?.type) return
 
@@ -536,7 +599,12 @@ export function createAgentRuntime(options) {
             cacheLoadedSkill(result)
           }
 
-          applyWorkflowEffect(workflow?.afterTool?.({ toolName, result, toolStatus }))
+          applyWorkflowEffect(workflow?.afterTool?.({
+            toolName,
+            result,
+            toolStatus,
+            state: getState()
+          }))
 
           onToolEnd?.({ toolName, result, toolStatus, runId })
         }
@@ -608,6 +676,7 @@ export function createAgentRuntime(options) {
     activeRunId.value = ''
     agentMessages.value = []
     chatMessages.value = []
+    toolMessageIds.value = {}
     primedSkillContents.clear()
     clearPendingInteraction()
     suppressPendingOnText.value = false
@@ -622,6 +691,7 @@ export function createAgentRuntime(options) {
     primedSkillBundle,
     presentInteraction,
     clearPendingInteraction,
+    applyWorkflowEffect,
     pushMessage,
     runAgent,
     stopAgentChat,

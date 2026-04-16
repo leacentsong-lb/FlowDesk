@@ -3,6 +3,7 @@ use std::{fs, path::{Path, PathBuf}};
 use std::thread;
 use std::time::Duration;
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 
 /// Run a shell command in a specified directory.
 /// Safety: blocks dangerous patterns and scopes execution to the current workspace.
@@ -631,6 +632,8 @@ pub async fn agent_multiedit_file(
 pub async fn agent_web_search(
     query: String,
     limit: Option<usize>,
+    provider: Option<String>,
+    api_key: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let normalized_query = normalize_search_query(&query);
     if normalized_query.is_empty() {
@@ -648,7 +651,26 @@ pub async fn agent_web_search(
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut providers: Vec<String> = Vec::new();
 
+    let normalized_provider = provider
+        .unwrap_or_else(|| "tavily".to_string())
+        .trim()
+        .to_lowercase();
+    let search_api_key = api_key.unwrap_or_default().trim().to_string();
+
+    if normalized_provider == "tavily" && !search_api_key.is_empty() {
+        if let Ok(tavily_results) = fetch_tavily_results(&client, &normalized_query, result_limit, &search_api_key).await {
+            if !tavily_results.is_empty() {
+                providers.push("tavily".to_string());
+                merge_search_results(&mut results, tavily_results, result_limit);
+            }
+        }
+    }
+
     for candidate_query in search_queries.iter() {
+        if results.len() >= result_limit {
+            break;
+        }
+
         let instant_results = fetch_duckduckgo_instant_results(&client, candidate_query).await.unwrap_or_default();
         if !instant_results.is_empty() {
             providers.push("duckduckgo_instant".to_string());
@@ -672,6 +694,7 @@ pub async fn agent_web_search(
         "ok": true,
         "query": query,
         "normalizedQuery": normalized_query,
+        "requestedProvider": normalized_provider,
         "provider": if providers.is_empty() {
             "none".to_string()
         } else {
@@ -684,6 +707,66 @@ pub async fn agent_web_search(
             format!("找到 {} 条搜索结果。", results.len())
         }
     }))
+}
+
+async fn fetch_tavily_results(
+    client: &reqwest::Client,
+    query: &str,
+    limit: usize,
+    api_key: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let response = client
+        .post("https://api.tavily.com/search")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "query": query,
+            "search_depth": "advanced",
+            "max_results": limit,
+            "include_answer": false,
+            "include_images": false,
+            "include_raw_content": false
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Tavily search failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Tavily search failed: HTTP {} {}", status.as_u16(), body));
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Tavily response: {}", e))?;
+
+    let results = payload["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            let title = item["title"].as_str().unwrap_or("").trim().to_string();
+            let url = item["url"].as_str().unwrap_or("").trim().to_string();
+            let snippet = item["content"].as_str().unwrap_or("").trim().to_string();
+            if title.is_empty() || url.is_empty() {
+                return None;
+            }
+
+            Some(serde_json::json!({
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "score": item["score"].as_f64(),
+                "provider": "tavily"
+            }))
+        })
+        .collect();
+
+    Ok(results)
 }
 
 fn collect_duckduckgo_topics(value: &serde_json::Value, output: &mut Vec<serde_json::Value>) {
@@ -981,6 +1064,268 @@ fn merge_search_results(
     }
 }
 
+#[tauri::command]
+pub async fn agent_scan_skills(
+    roots: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for root in roots.iter() {
+            let expanded_root = expand_user_path(root);
+            if !expanded_root.exists() || !expanded_root.is_dir() {
+                continue;
+            }
+
+            collect_skill_entries(&expanded_root, &expanded_root, &mut items, &mut seen)?;
+        }
+
+        items.sort_by(|left, right| {
+            let left_name = left["title"].as_str().unwrap_or(left["name"].as_str().unwrap_or(""));
+            let right_name = right["title"].as_str().unwrap_or(right["name"].as_str().unwrap_or(""));
+            left_name.cmp(right_name)
+                .then_with(|| left["skillPath"].as_str().unwrap_or("").cmp(right["skillPath"].as_str().unwrap_or("")))
+        });
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "skills": items,
+            "count": items.len()
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_read_skill(
+    skill_path: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let content = fs::read_to_string(&skill_path)
+            .map_err(|e| format!("Failed to read {}: {}", skill_path, e))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "skillPath": skill_path,
+            "content": content
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_write_skill(
+    skill_path: String,
+    content: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fs::write(&skill_path, content.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", skill_path, e))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "skillPath": skill_path,
+            "bytes": content.len()
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_delete_skill(
+    skill_path: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let skill_file = PathBuf::from(&skill_path);
+        let file_name = skill_file.file_name().and_then(|value| value.to_str()).unwrap_or("");
+        if file_name != "SKILL.md" {
+            return Err(format!("Refusing to delete non-skill file: {}", skill_path));
+        }
+
+        let skill_dir = skill_file.parent()
+            .ok_or_else(|| format!("Skill path has no parent directory: {}", skill_path))?;
+
+        fs::remove_dir_all(skill_dir)
+            .map_err(|e| format!("Failed to delete {}: {}", skill_dir.display(), e))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "deletedPath": skill_dir.to_string_lossy().to_string()
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+fn expand_user_path(input: &str) -> PathBuf {
+    let trimmed = input.trim();
+    if trimmed == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    PathBuf::from(trimmed)
+}
+
+fn collect_skill_entries(
+    scan_root: &Path,
+    current: &Path,
+    items: &mut Vec<serde_json::Value>,
+    seen: &mut HashSet<String>,
+) -> Result<(), String> {
+    let skill_path = current.join("SKILL.md");
+    if skill_path.is_file() {
+        let canonical = fs::canonicalize(&skill_path)
+            .map_err(|e| format!("Failed to canonicalize {}: {}", skill_path.display(), e))?;
+        let key = canonical.to_string_lossy().to_string();
+
+        if seen.insert(key) {
+            items.push(build_skill_entry(scan_root, &canonical)?);
+        }
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(current)
+        .map_err(|e| format!("Failed to scan {}: {}", current.to_string_lossy(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry in {}: {}", current.to_string_lossy(), e))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(file_type) = entry.file_type() else { continue };
+
+        if !file_type.is_dir() || should_skip_skill_scan_dir(&name) {
+            continue;
+        }
+
+        collect_skill_entries(scan_root, &path, items, seen)?;
+    }
+
+    Ok(())
+}
+
+fn build_skill_entry(scan_root: &Path, skill_path: &Path) -> Result<serde_json::Value, String> {
+    let content = fs::read_to_string(skill_path)
+        .map_err(|e| format!("Failed to read {}: {}", skill_path.display(), e))?;
+    let (meta, body) = parse_skill_frontmatter(&content);
+    let skill_dir = skill_path.parent().unwrap_or(scan_root);
+    let files = collect_skill_files(skill_dir)?;
+
+    let name = meta.get("name")
+        .cloned()
+        .unwrap_or_else(|| skill_dir.file_name().and_then(|value| value.to_str()).unwrap_or("unknown-skill").to_string());
+    let description = meta.get("description").cloned().unwrap_or_default();
+    let title = extract_skill_title(&body).unwrap_or_else(|| to_title_case(&name));
+
+    Ok(serde_json::json!({
+        "id": skill_path.to_string_lossy().to_string(),
+        "name": name,
+        "title": title,
+        "description": description,
+        "skillPath": skill_path.to_string_lossy().to_string(),
+        "rootPath": scan_root.to_string_lossy().to_string(),
+        "files": files
+    }))
+}
+
+fn parse_skill_frontmatter(content: &str) -> (HashMap<String, String>, String) {
+    let mut meta = HashMap::new();
+
+    if let Some(rest) = content.strip_prefix("---\n") {
+        if let Some(idx) = rest.find("\n---\n") {
+            let frontmatter = &rest[..idx];
+            let body = rest[idx + 5..].to_string();
+
+            for line in frontmatter.lines() {
+                if let Some(separator) = line.find(':') {
+                    let key = line[..separator].trim();
+                    let value = line[separator + 1..].trim();
+                    if !key.is_empty() {
+                        meta.insert(key.to_string(), value.to_string());
+                    }
+                }
+            }
+
+            return (meta, body);
+        }
+    }
+
+    (meta, content.to_string())
+}
+
+fn extract_skill_title(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('#'))
+        .map(|line| line.trim_start_matches('#').trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+fn to_title_case(value: &str) -> String {
+    value
+        .split(['-', '_', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn collect_skill_files(skill_dir: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    collect_relative_files(skill_dir, skill_dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_relative_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(current)
+        .map_err(|e| format!("Failed to scan {}: {}", current.to_string_lossy(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry in {}: {}", current.to_string_lossy(), e))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(file_type) = entry.file_type() else { continue };
+
+        if file_type.is_dir() {
+            if should_skip_dir(&name) {
+                continue;
+            }
+            collect_relative_files(root, &path, files)?;
+            continue;
+        }
+
+        let relative = path.strip_prefix(root)
+            .ok()
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+        files.push(relative);
+    }
+
+    Ok(())
+}
+
 /// Scan a workspace recursively and return detected git repositories.
 #[tauri::command]
 pub async fn agent_scan_workspace_repos(
@@ -1086,4 +1431,12 @@ fn should_skip_dir(name: &str) -> bool {
             | ".idea"
             | ".vscode"
     ) || name.starts_with('.')
+}
+
+fn should_skip_skill_scan_dir(name: &str) -> bool {
+    if matches!(name, ".codex" | ".cursor" | ".agents") {
+        return false;
+    }
+
+    should_skip_dir(name)
 }

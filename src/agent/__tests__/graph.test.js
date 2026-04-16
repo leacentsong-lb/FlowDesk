@@ -15,6 +15,22 @@ vi.mock('../tools/index.js', () => ({
   TOOL_HANDLERS: {
     run_command: runCommandMock
   },
+  getAllTools: () => [
+    {
+      type: 'function',
+      function: {
+        name: 'run_command',
+        description: '执行 shell 命令',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' }
+          },
+          required: ['command']
+        }
+      }
+    }
+  ],
   TOOLS: [
     {
       type: 'function',
@@ -35,6 +51,10 @@ vi.mock('../tools/index.js', () => ({
 
 vi.mock('../context.js', () => ({
   buildSystemPrompt: vi.fn(() => 'system prompt'),
+  buildPromptMessages: vi.fn(() => ([
+    { role: 'system', content: 'stable prompt' },
+    { role: 'system', content: 'dynamic prompt' }
+  ])),
   microcompact: vi.fn(),
   estimateTokens: vi.fn(() => 0)
 }))
@@ -183,5 +203,35 @@ describe('agent graph', () => {
     })
 
     expect(result.finalText).toBe('')
+  })
+
+  it('sends stable and dynamic system messages ahead of conversation history', async () => {
+    streamAgentMock.mockImplementationOnce(async (payload, onEvent) => {
+      expect(payload.messages.slice(0, 2)).toEqual([
+        { role: 'system', content: 'stable prompt' },
+        { role: 'system', content: 'dynamic prompt' }
+      ])
+      expect(payload.messages[2]).toEqual({ role: 'user', content: '读一下 README' })
+      onEvent({ kind: 'done', finishReason: 'stop' })
+    })
+
+    await runAgentGraph([{ role: 'user', content: '读一下 README' }], {
+      ctx: {
+        settings: {
+          aiConfig: {
+            apiKey: 'test-key',
+            provider: 'openai',
+            model: 'gpt-test'
+          }
+        },
+        jira: {}
+      },
+      state: {
+        mode: 'general',
+        version: '',
+        environment: 'production',
+        completedTools: []
+      }
+    })
   })
 })

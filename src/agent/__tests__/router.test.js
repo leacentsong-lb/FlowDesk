@@ -68,6 +68,17 @@ describe('routeAgentIntent', () => {
     })
   })
 
+  it('keeps neutral continue messages in the general harness by default', () => {
+    const route = routeAgentIntent('继续')
+
+    expect(route).toMatchObject({
+      mode: 'general',
+      workflowId: 'general',
+      riskLevel: 'low',
+      requiresApproval: false
+    })
+  })
+
   it('marks dangerous destructive requests as approval-required', () => {
     const route = routeAgentIntent('帮我执行 rm -rf dist 并重新初始化')
 

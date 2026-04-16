@@ -43,7 +43,13 @@ describe('Claude-style MVP tool surface', () => {
       'glob',
       'grep',
       'todo_write',
-      'web_search'
+      'web_search',
+      'create_release_session',
+      'generate_release_readiness_report',
+      'execute_release_merge',
+      'create_release_tag',
+      'generate_confluence_draft',
+      'publish_confluence_release_doc'
     ]))
 
     expect(typeof TOOL_HANDLERS.bash).toBe('function')
@@ -193,11 +199,20 @@ describe('Claude-style MVP tool surface', () => {
 
     expect(webSearchSchema.function.name).toBe('web_search')
 
-    await webSearchHandler({ query: 'langgraph', limit: 5 }, {})
+    await webSearchHandler({ query: 'langgraph', limit: 5 }, {
+      settings: {
+        searchConfig: {
+          provider: 'tavily',
+          apiKey: 'tvly-test'
+        }
+      }
+    })
 
     expect(invoke).toHaveBeenCalledWith('agent_web_search', {
       query: 'langgraph',
-      limit: 5
+      limit: 5,
+      provider: 'tavily',
+      apiKey: 'tvly-test'
     })
   })
 })

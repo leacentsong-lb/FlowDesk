@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useReleaseStore } from '../../stores/release'
+import TracePanel from './TracePanel.vue'
 import {
   formatJson,
   getStatusTone,
@@ -20,6 +21,7 @@ const copiedState = ref('')
 const displayMessages = computed(() =>
   (release.chatMessages || []).map(message => normalizeChatMessage(message))
 )
+const activeTrace = computed(() => release.activeTrace || null)
 
 const agentTitle = computed(() => '开发助手')
 const inputPlaceholder = computed(() => `给 ${agentTitle.value} 发消息...`)
@@ -129,10 +131,25 @@ function handleDockedAction(action) {
 }
 
 /**
+ * @returns {string}
+ */
+function getInteractionTone() {
+  return pendingInteraction.value?.meta?.severity || 'default'
+}
+
+/**
+ * @returns {string}
+ */
+function getInteractionLabel() {
+  return pendingInteraction.value?.meta?.approvalLabel || ''
+}
+
+/**
  * @returns {void}
  */
 function handleSendMessage() {
   const text = userInput.value.trim()
+  if (release.agentRunning) return
   if (!text) return
   userInput.value = ''
   release.agentChat(text)
@@ -161,7 +178,7 @@ function openPromptStudio() {
  * @returns {void}
  */
 function handleInputKeydown(event) {
-  if (event.key === 'Enter' && !event.shiftKey) {
+  if (event.key === 'Enter' && event.shiftKey) {
     event.preventDefault()
     handleSendMessage()
   }
@@ -238,7 +255,7 @@ async function copyText(key, value) {
  * @returns {boolean}
  */
 function hasToolPayload(message) {
-  return Boolean(message.meta?.displayResult)
+  return Boolean(message.meta?.displayResult) || getToolStatusHistory(message).length > 0
 }
 
 /**
@@ -274,6 +291,26 @@ function getReasoningSummary(message) {
 }
 
 /**
+ * @param {object} message
+ * @returns {Array<object>}
+ */
+function getToolStatusHistory(message) {
+  return Array.isArray(message?.meta?.statusHistory) ? message.meta.statusHistory : []
+}
+
+/**
+ * @param {string} status
+ * @returns {string}
+ */
+function getToolStatusLabel(status) {
+  if (status === 'running') return '运行中'
+  if (status === 'success') return '成功'
+  if (status === 'error') return '失败'
+  if (status === 'recovering') return '恢复中'
+  return status || '未知'
+}
+
+/**
  * @param {object} quickAction
  * @returns {void}
  */
@@ -304,233 +341,264 @@ onMounted(() => {
 
 <template>
   <div class="chat-panel cursor-chat">
-    <header data-testid="chat-topbar" class="chat-topbar">
-      <div class="topbar-left">
-        <button class="icon-btn" @click="emit('navigate-home')" title="返回主页">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-        </button>
-        <div class="agent-mark">
-          <span class="agent-mark-dot"></span>
-        </div>
-        <div class="topbar-copy">
-          <div class="chat-title">{{ agentTitle }}</div>
-          <div class="chat-subtitle">{{ release.isReleaseMode ? 'Release workflow' : 'Workspace chat' }}</div>
-        </div>
-      </div>
-
-      <div class="topbar-right">
-        <span v-if="release.version" class="chat-version">v{{ release.version }}</span>
-        <span class="session-badge" :class="`tone-${sessionState.tone}`">{{ sessionState.label }}</span>
-        <button
-          data-testid="open-prompt-studio-btn"
-          class="icon-btn"
-          title="打开提示词调试台"
-          @click="openPromptStudio"
-        >
-          Prompt
-        </button>
-        <button
-          v-if="release.agentRunning"
-          data-testid="chat-stop-btn"
-          class="stop-btn"
-          @click="handleStopChat"
-          title="终止当前对话"
-        >
-          终止
-        </button>
-        <button class="icon-btn" @click="resetChat" title="重新开始">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>
-        </button>
-      </div>
-    </header>
-
-    <section ref="chatContainer" data-testid="chat-timeline" class="chat-timeline">
-      <div class="timeline-inner">
-        <div v-if="displayMessages.length === 0" class="timeline-empty">
-          <div class="empty-kicker">{{ welcomeTitle }}</div>
-          <h2 class="empty-title">{{ agentTitle }}</h2>
-          <p class="empty-subtitle">{{ welcomeSubtitle }}</p>
-          <div class="empty-grid">
-            <button
-              v-for="quickAction in quickActions"
-              :key="quickAction.id"
-              class="empty-action-card"
-              @click="triggerQuickAction(quickAction)"
-            >
-              <span class="empty-action-label">{{ quickAction.label }}</span>
-              <span class="empty-action-hint">{{ quickAction.text }}</span>
-            </button>
+    <div class="chat-main">
+      <header data-testid="chat-topbar" class="chat-topbar">
+        <div class="topbar-left">
+          <button class="icon-btn" @click="emit('navigate-home')" title="返回主页">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <div class="agent-mark">
+            <span class="agent-mark-dot"></span>
+          </div>
+          <div class="topbar-copy">
+            <div class="chat-title">{{ agentTitle }}</div>
+            <div class="chat-subtitle">{{ release.isReleaseMode ? 'Release workflow' : 'Workspace chat' }}</div>
           </div>
         </div>
 
-        <template v-for="msg in displayMessages" :key="msg.id">
-          <article v-if="msg.role === 'agent'" class="timeline-entry agent-entry" :class="[`entry-${msg.kind || 'message'}`]">
-            <div class="entry-rail">
-              <span class="entry-node" :class="[`tone-${getStatusTone(msg.status)}`]"></span>
-            </div>
-
-            <div class="entry-main">
-              <div class="entry-meta">
-                <span class="entry-author">Agent</span>
-                <span class="entry-separator">·</span>
-                <span class="entry-time">{{ formatTime(msg.ts) }}</span>
-              </div>
-
-              <details v-if="msg._reasoning" class="reasoning-block">
-                <summary data-testid="reasoning-summary" class="reasoning-toggle">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                  <span class="reasoning-label">思考</span>
-                  <span class="reasoning-preview">{{ getReasoningSummary(msg) }}</span>
-                  <span class="reasoning-action">展开</span>
-                </summary>
-                <pre class="reasoning-text">{{ msg._reasoning }}</pre>
-              </details>
-
-              <div
-                v-if="msg.kind === 'tool' || msg.kind === 'skill'"
-                data-testid="tool-status-card"
-                class="tool-card"
-                :class="[`${getActivityKind(msg)}-card`, `tone-${getStatusTone(msg.status)}`]"
-                :data-activity-kind="getActivityKind(msg)"
-              >
-                <div class="activity-header">
-                  <span class="activity-badge" :class="`kind-${getActivityKind(msg)}`">{{ getActivityBadge(msg) }}</span>
-                  <span v-if="getActivityName(msg)" class="activity-name">{{ getActivityName(msg) }}</span>
-                </div>
-                <p class="tool-summary compact-tool-line">{{ msg.meta?.compactText || msg.text }}</p>
-                <details v-if="hasToolPayload(msg)" class="tool-details">
-                  <summary>详情</summary>
-                  <pre class="tool-json">{{ formatJson(msg.meta.displayResult) }}</pre>
-                </details>
-              </div>
-
-              <div v-else class="message-shell">
-                <div v-if="isStreaming(msg) && !msg.text" class="thinking-indicator">
-                  <span class="thinking-dot"></span>
-                  <span class="thinking-dot"></span>
-                  <span class="thinking-dot"></span>
-                  <span class="thinking-label">思考中</span>
-                </div>
-
-                <template v-for="(block, blockIndex) in msg.blocks" :key="`${msg.id}-${blockIndex}-${block.type}`">
-                  <div
-                    v-if="block.type === 'markdown'"
-                    class="message-block markdown-block"
-                    v-html="renderMarkdownBlock(block.content)"
-                  ></div>
-
-                  <div
-                    v-else-if="block.type === 'code'"
-                    data-testid="code-block"
-                    class="message-block code-block"
-                  >
-                    <div class="code-toolbar">
-                      <span class="code-language">{{ block.language || 'text' }}</span>
-                      <button
-                        data-testid="copy-code-btn"
-                        class="block-copy-btn"
-                        @click="copyText(`${msg.id}-${blockIndex}`, block.content)"
-                      >
-                        {{ copiedState === `${msg.id}-${blockIndex}` ? '已复制' : '复制代码' }}
-                      </button>
-                    </div>
-                    <pre class="code-surface"><code v-html="renderCodeBlock(block)"></code></pre>
-                  </div>
-
-                  <div
-                    v-else-if="block.type === 'json'"
-                    data-testid="json-block"
-                    class="message-block json-block"
-                  >
-                    <div class="json-toolbar">
-                      <span class="json-label">JSON</span>
-                      <button
-                        class="block-copy-btn"
-                        @click="copyText(`${msg.id}-${blockIndex}`, formatJsonBlock(block))"
-                      >
-                        {{ copiedState === `${msg.id}-${blockIndex}` ? '已复制' : '复制 JSON' }}
-                      </button>
-                    </div>
-                    <pre class="json-surface">{{ formatJsonBlock(block) }}</pre>
-                  </div>
-
-                </template>
-              </div>
-            </div>
-          </article>
-
-          <article v-else-if="msg.role === 'user'" class="timeline-entry user-entry">
-            <div class="entry-main user-main">
-              <div class="entry-meta user-meta">
-                <span class="entry-author">You</span>
-                <span class="entry-separator">·</span>
-                <span class="entry-time">{{ formatTime(msg.ts) }}</span>
-              </div>
-              <div class="user-inline">{{ msg.text }}</div>
-            </div>
-          </article>
-        </template>
-      </div>
-    </section>
-
-    <footer data-testid="chat-composer" class="composer-panel">
-      <div class="composer-inner">
-        <div
-          v-if="pendingInteraction"
-          data-testid="chat-docked-interaction"
-          class="docked-interaction"
-        >
-          <div class="docked-interaction-copy">
-            <div class="docked-interaction-title">{{ pendingInteraction.title }}</div>
-            <div v-if="pendingInteraction.description" class="docked-interaction-description">
-              {{ pendingInteraction.description }}
-            </div>
-          </div>
-          <div class="docked-interaction-actions">
-            <button
-              v-for="action in pendingInteraction.actions"
-              :key="action.id"
-              :data-testid="`chat-action-${action.id}`"
-              class="action-btn docked-action-btn"
-              :class="[`variant-${getActionVariant(action)}`]"
-              :disabled="isActionDisabled(action)"
-              @click="handleDockedAction(action)"
-            >
-              {{ action.label }}
-            </button>
-          </div>
-        </div>
-
-        <div class="composer-shell">
-          <span class="composer-prefix">Agent</span>
-          <textarea
-            ref="composerRef"
-            v-model="userInput"
-            class="chat-input composer-input"
-            rows="1"
-            :placeholder="inputPlaceholder"
-            @keydown="handleInputKeydown"
-          ></textarea>
-          <button class="send-btn" :disabled="!userInput.trim() || release.agentRunning" @click="handleSendMessage">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <div class="topbar-right">
+          <span v-if="release.version" class="chat-version">v{{ release.version }}</span>
+          <span class="session-badge" :class="`tone-${sessionState.tone}`">{{ sessionState.label }}</span>
+          <button
+            data-testid="open-prompt-studio-btn"
+            class="icon-btn"
+            title="打开提示词调试台"
+            @click="openPromptStudio"
+          >
+            Prompt
+          </button>
+          <button
+            v-if="release.agentRunning"
+            data-testid="chat-stop-btn"
+            class="stop-btn"
+            @click="handleStopChat"
+            title="终止当前对话"
+          >
+            终止
+          </button>
+          <button class="icon-btn" @click="resetChat" title="重新开始">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>
           </button>
         </div>
+      </header>
 
-        <div class="composer-hint-row">
-          <span class="input-hint">Enter 发送，Shift + Enter 换行</span>
+      <section ref="chatContainer" data-testid="chat-timeline" class="chat-timeline">
+        <div class="timeline-inner">
+          <div v-if="displayMessages.length === 0" class="timeline-empty">
+            <div class="empty-kicker">{{ welcomeTitle }}</div>
+            <h2 class="empty-title">{{ agentTitle }}</h2>
+            <p class="empty-subtitle">{{ welcomeSubtitle }}</p>
+            <div class="empty-grid">
+              <button
+                v-for="quickAction in quickActions"
+                :key="quickAction.id"
+                class="empty-action-card"
+                @click="triggerQuickAction(quickAction)"
+              >
+                <span class="empty-action-label">{{ quickAction.label }}</span>
+                <span class="empty-action-hint">{{ quickAction.text }}</span>
+              </button>
+            </div>
+          </div>
+
+          <template v-for="msg in displayMessages" :key="msg.id">
+            <article v-if="msg.role === 'agent'" class="timeline-entry agent-entry" :class="[`entry-${msg.kind || 'message'}`]">
+              <div class="entry-rail">
+                <span class="entry-node" :class="[`tone-${getStatusTone(msg.status)}`]"></span>
+              </div>
+
+              <div class="entry-main">
+                <div class="entry-meta">
+                  <span class="entry-author">Agent</span>
+                  <span class="entry-separator">·</span>
+                  <span class="entry-time">{{ formatTime(msg.ts) }}</span>
+                </div>
+
+                <details v-if="msg._reasoning" class="reasoning-block">
+                  <summary data-testid="reasoning-summary" class="reasoning-toggle">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                    <span class="reasoning-label">思考</span>
+                    <span class="reasoning-preview">{{ getReasoningSummary(msg) }}</span>
+                    <span class="reasoning-action">展开</span>
+                  </summary>
+                  <pre class="reasoning-text">{{ msg._reasoning }}</pre>
+                </details>
+
+                <div
+                  v-if="msg.kind === 'tool' || msg.kind === 'skill'"
+                  data-testid="tool-status-card"
+                  class="tool-card"
+                  :class="[`${getActivityKind(msg)}-card`, `tone-${getStatusTone(msg.status)}`]"
+                  :data-activity-kind="getActivityKind(msg)"
+                >
+                  <div class="activity-header">
+                    <span class="activity-badge" :class="`kind-${getActivityKind(msg)}`">{{ getActivityBadge(msg) }}</span>
+                    <span v-if="getActivityName(msg)" class="activity-name">{{ getActivityName(msg) }}</span>
+                  </div>
+                  <p class="tool-summary compact-tool-line">{{ msg.meta?.compactText || msg.text }}</p>
+                  <details v-if="hasToolPayload(msg)" class="tool-details">
+                    <summary data-testid="tool-details-toggle">详情</summary>
+                    <div v-if="getToolStatusHistory(msg).length > 0" class="tool-status-history">
+                      <div
+                        v-for="(historyItem, historyIndex) in getToolStatusHistory(msg)"
+                        :key="`${msg.id}-history-${historyIndex}`"
+                        class="tool-status-history-item"
+                      >
+                        <span class="tool-status-history-badge" :class="`tone-${getStatusTone(historyItem.status)}`">
+                          {{ getToolStatusLabel(historyItem.status) }}
+                        </span>
+                        <span class="tool-status-history-text">{{ historyItem.text }}</span>
+                      </div>
+                    </div>
+                    <pre v-if="msg.meta?.displayResult" class="tool-json">{{ formatJson(msg.meta.displayResult) }}</pre>
+                  </details>
+                </div>
+
+                <div v-else class="message-shell">
+                  <div v-if="isStreaming(msg) && !msg.text" class="thinking-indicator">
+                    <span class="thinking-dot"></span>
+                    <span class="thinking-dot"></span>
+                    <span class="thinking-dot"></span>
+                    <span class="thinking-label">思考中</span>
+                  </div>
+
+                  <template v-for="(block, blockIndex) in msg.blocks" :key="`${msg.id}-${blockIndex}-${block.type}`">
+                    <div
+                      v-if="block.type === 'markdown'"
+                      class="message-block markdown-block"
+                      v-html="renderMarkdownBlock(block.content)"
+                    ></div>
+
+                    <div
+                      v-else-if="block.type === 'code'"
+                      data-testid="code-block"
+                      class="message-block code-block"
+                    >
+                      <div class="code-toolbar">
+                        <span class="code-language">{{ block.language || 'text' }}</span>
+                        <button
+                          data-testid="copy-code-btn"
+                          class="block-copy-btn"
+                          @click="copyText(`${msg.id}-${blockIndex}`, block.content)"
+                        >
+                          {{ copiedState === `${msg.id}-${blockIndex}` ? '已复制' : '复制代码' }}
+                        </button>
+                      </div>
+                      <pre class="code-surface"><code v-html="renderCodeBlock(block)"></code></pre>
+                    </div>
+
+                    <div
+                      v-else-if="block.type === 'json'"
+                      data-testid="json-block"
+                      class="message-block json-block"
+                    >
+                      <div class="json-toolbar">
+                        <span class="json-label">JSON</span>
+                        <button
+                          class="block-copy-btn"
+                          @click="copyText(`${msg.id}-${blockIndex}`, formatJsonBlock(block))"
+                        >
+                          {{ copiedState === `${msg.id}-${blockIndex}` ? '已复制' : '复制 JSON' }}
+                        </button>
+                      </div>
+                      <pre class="json-surface">{{ formatJsonBlock(block) }}</pre>
+                    </div>
+
+                  </template>
+                </div>
+              </div>
+            </article>
+
+            <article v-else-if="msg.role === 'user'" class="timeline-entry user-entry">
+              <div class="entry-main user-main">
+                <div class="entry-meta user-meta">
+                  <span class="entry-author">You</span>
+                  <span class="entry-separator">·</span>
+                  <span class="entry-time">{{ formatTime(msg.ts) }}</span>
+                </div>
+                <div class="user-inline">{{ msg.text }}</div>
+              </div>
+            </article>
+          </template>
         </div>
-      </div>
-    </footer>
+      </section>
+
+      <footer data-testid="chat-composer" class="composer-panel">
+        <div class="composer-inner">
+          <div
+            v-if="pendingInteraction"
+            data-testid="chat-docked-interaction"
+            class="docked-interaction"
+            :data-interaction-tone="getInteractionTone()"
+          >
+            <div class="docked-interaction-copy">
+              <div v-if="getInteractionLabel()" class="docked-interaction-chip">
+                {{ getInteractionLabel() }}
+              </div>
+              <div class="docked-interaction-title">{{ pendingInteraction.title }}</div>
+              <div v-if="pendingInteraction.description" class="docked-interaction-description">
+                {{ pendingInteraction.description }}
+              </div>
+            </div>
+            <div class="docked-interaction-actions">
+              <button
+                v-for="action in pendingInteraction.actions"
+                :key="action.id"
+                :data-testid="`chat-action-${action.id}`"
+                class="action-btn docked-action-btn"
+                :class="[`variant-${getActionVariant(action)}`]"
+                :disabled="isActionDisabled(action)"
+                @click="handleDockedAction(action)"
+              >
+                {{ action.label }}
+              </button>
+            </div>
+          </div>
+
+          <div class="composer-shell" :class="{ 'is-running': release.agentRunning }">
+            <span data-testid="composer-ring-top" class="composer-ring composer-ring-top" aria-hidden="true"></span>
+            <span data-testid="composer-ring-right" class="composer-ring composer-ring-right" aria-hidden="true"></span>
+            <span data-testid="composer-ring-bottom" class="composer-ring composer-ring-bottom" aria-hidden="true"></span>
+            <span data-testid="composer-ring-left" class="composer-ring composer-ring-left" aria-hidden="true"></span>
+            <span class="composer-prefix" :data-running="release.agentRunning ? 'true' : 'false'">Agent</span>
+            <textarea
+              ref="composerRef"
+              v-model="userInput"
+              class="chat-input composer-input"
+              rows="1"
+              :disabled="release.agentRunning"
+              :placeholder="inputPlaceholder"
+              @keydown="handleInputKeydown"
+            ></textarea>
+            <button class="send-btn" :disabled="!userInput.trim() || release.agentRunning" @click="handleSendMessage">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+            </button>
+          </div>
+
+          <div class="composer-hint-row">
+            <span class="input-hint">Enter 换行，Shift + Enter 发送</span>
+          </div>
+        </div>
+      </footer>
+    </div>
+
+    <TracePanel class="chat-trace-panel" :trace="activeTrace" :running="release.agentRunning" />
   </div>
 </template>
 
 <style scoped>
 .chat-panel {
   display: flex;
-  flex-direction: column;
   height: 100%;
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--bg-secondary) 96%, transparent), color-mix(in srgb, var(--bg-primary) 98%, transparent));
+}
+
+.chat-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
 }
 
 .chat-topbar {
@@ -993,6 +1061,59 @@ onMounted(() => {
   color: var(--text-tertiary);
 }
 
+.tool-status-history {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tool-status-history-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tool-status-history-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--glass-border) 84%, transparent);
+  background: color-mix(in srgb, var(--bg-primary) 76%, transparent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tool-status-history-badge.tone-info {
+  color: var(--accent-secondary);
+}
+
+.tool-status-history-badge.tone-success {
+  color: var(--success);
+  border-color: var(--success-border);
+}
+
+.tool-status-history-badge.tone-error {
+  color: var(--error);
+  border-color: var(--error-border);
+}
+
+.tool-status-history-badge.tone-warning {
+  color: var(--warning);
+  border-color: var(--warning-border);
+}
+
+.tool-status-history-text {
+  min-width: 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .tool-json,
 .json-surface,
 .code-surface,
@@ -1079,10 +1200,29 @@ onMounted(() => {
   box-shadow: 0 10px 24px color-mix(in srgb, black 10%, transparent);
 }
 
+.docked-interaction[data-interaction-tone="high"] {
+  border-color: color-mix(in srgb, var(--error) 32%, var(--glass-border));
+  background: color-mix(in srgb, var(--error) 6%, var(--bg-secondary));
+}
+
 .docked-interaction-copy {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.docked-interaction-chip {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--error) 28%, transparent);
+  background: color-mix(in srgb, var(--error) 10%, transparent);
+  color: var(--error);
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .docked-interaction-title {
@@ -1243,6 +1383,8 @@ onMounted(() => {
 }
 
 .composer-shell {
+  position: relative;
+  isolation: isolate;
   display: flex;
   align-items: flex-end;
   gap: 10px;
@@ -1251,6 +1393,101 @@ onMounted(() => {
   border: 1px solid color-mix(in srgb, var(--glass-border) 92%, transparent);
   background: color-mix(in srgb, var(--bg-secondary) 96%, transparent);
   box-shadow: 0 12px 30px color-mix(in srgb, black 12%, transparent);
+}
+
+.composer-ring {
+  position: absolute;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+
+.composer-ring-top,
+.composer-ring-bottom {
+  left: -1px;
+  right: -1px;
+  height: 1px;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--accent-primary) 24%, transparent) 16%,
+    color-mix(in srgb, var(--accent-primary) 62%, transparent) 50%,
+    color-mix(in srgb, var(--accent-primary) 24%, transparent) 84%,
+    transparent 100%
+  );
+  background-size: 180px 100%;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent-primary) 18%, transparent);
+}
+
+.composer-ring-left,
+.composer-ring-right {
+  top: -1px;
+  bottom: -1px;
+  width: 1px;
+  background-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    color-mix(in srgb, var(--accent-primary) 24%, transparent) 16%,
+    color-mix(in srgb, var(--accent-primary) 62%, transparent) 50%,
+    color-mix(in srgb, var(--accent-primary) 24%, transparent) 84%,
+    transparent 100%
+  );
+  background-size: 100% 180px;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent-primary) 18%, transparent);
+}
+
+.composer-ring-top {
+  top: -1px;
+  border-radius: 12px 12px 0 0;
+}
+
+.composer-ring-right {
+  right: -1px;
+  border-radius: 0 12px 12px 0;
+}
+
+.composer-ring-bottom {
+  bottom: -1px;
+  border-radius: 0 0 12px 12px;
+}
+
+.composer-ring-left {
+  left: -1px;
+  border-radius: 12px 0 0 12px;
+}
+
+.composer-shell.is-running {
+  border-color: transparent;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--bg-secondary) 97%, transparent),
+      color-mix(in srgb, var(--bg-secondary) 94%, transparent)
+    ) padding-box,
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent-primary) 82%, transparent) 0%,
+      color-mix(in srgb, var(--accent-secondary) 80%, transparent) 52%,
+      color-mix(in srgb, var(--accent-warm) 78%, transparent) 100%
+    ) border-box;
+  box-shadow:
+    0 12px 30px color-mix(in srgb, black 12%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent-primary) 8%, transparent);
+}
+
+.composer-shell.is-running .composer-ring {
+  opacity: 0;
+}
+
+.composer-shell.is-running .composer-ring-top,
+.composer-shell.is-running .composer-ring-bottom {
+  animation: none;
+}
+
+.composer-shell.is-running .composer-ring-right,
+.composer-shell.is-running .composer-ring-left {
+  animation: none;
 }
 
 .composer-shell:focus-within {
@@ -1262,22 +1499,54 @@ onMounted(() => {
 
 .composer-prefix {
   display: inline-flex;
+  align-self: center;
+  position: relative;
+  z-index: 1;
   align-items: center;
   justify-content: center;
-  min-width: 46px;
-  height: 28px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-primary) 64%, var(--bg-secondary));
-  border: 1px solid color-mix(in srgb, var(--glass-border) 82%, transparent);
-  color: var(--text-tertiary);
+  gap: 6px;
+  min-width: 72px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #2563eb 0%, #7c3aed 58%, #06b6d4 100%);
+  border: 1px solid color-mix(in srgb, white 22%, transparent);
+  color: #fff;
   font-size: 11px;
   font-family: var(--font-mono);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  box-shadow:
+    0 10px 24px color-mix(in srgb, #2563eb 24%, transparent),
+    inset 0 1px 0 color-mix(in srgb, white 24%, transparent);
+}
+
+.composer-prefix::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.7);
+}
+
+.composer-prefix[data-running="true"] {
+  background: linear-gradient(135deg, #8b5cf6 0%, #06b6d4 50%, #22c55e 100%);
+  background-size: 180% 180%;
+  animation: composer-prefix-shift 2.4s linear infinite;
+}
+
+.composer-prefix[data-running="true"]::before {
+  animation: composer-prefix-pulse 1s ease-in-out infinite;
 }
 
 .chat-input {
   flex: 1;
   min-height: 32px;
   max-height: 180px;
+  position: relative;
+  z-index: 1;
   padding: 4px 0;
   resize: none;
   overflow-y: auto;
@@ -1288,6 +1557,11 @@ onMounted(() => {
   font-size: 14px;
   line-height: 22px;
   box-sizing: border-box;
+}
+
+.chat-input:disabled {
+  cursor: not-allowed;
+  color: color-mix(in srgb, var(--text-primary) 70%, transparent);
 }
 
 .chat-input::placeholder {
@@ -1302,6 +1576,8 @@ onMounted(() => {
   width: 32px;
   height: 32px;
   display: inline-flex;
+  position: relative;
+  z-index: 1;
   align-items: center;
   justify-content: center;
   border: none;
@@ -1422,6 +1698,46 @@ onMounted(() => {
   30% {
     opacity: 1;
     transform: scale(1.08);
+  }
+}
+
+@keyframes composer-edge-flow-x {
+  from {
+    background-position-x: 0;
+  }
+  to {
+    background-position-x: 220px;
+  }
+}
+
+@keyframes composer-edge-flow-y {
+  from {
+    background-position-y: 0;
+  }
+  to {
+    background-position-y: 180px;
+  }
+}
+
+@keyframes composer-prefix-shift {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@keyframes composer-prefix-pulse {
+  0%,
+  100% {
+    transform: scale(0.88);
+    opacity: 0.72;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 1;
   }
 }
 </style>

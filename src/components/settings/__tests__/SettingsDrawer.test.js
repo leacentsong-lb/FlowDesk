@@ -120,6 +120,8 @@ describe('SettingsDrawer', () => {
     expect(wrapper.get('[data-testid="ai-base-url-input"]').exists()).toBe(true)
     expect(wrapper.get('[data-testid="ai-organization-input"]').exists()).toBe(true)
     expect(wrapper.get('[data-testid="ai-project-input"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="search-provider-select"]').element.value).toBe('tavily')
+    expect(wrapper.get('[data-testid="search-api-key-input"]').exists()).toBe(true)
   })
 
   it('renders a prompt tab with editor and preview panels', () => {

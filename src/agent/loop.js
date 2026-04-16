@@ -36,10 +36,11 @@ import { runAgentGraph } from './graph.js'
  * @param {function} options.onToolEnd - Called after each tool dispatch: (toolName, result).
  * @param {function} [options.onEvent] - Streaming agent events for runtime/UI.
  * @param {AbortSignal} [options.signal] - Optional abort signal to cancel the loop.
+ * @param {(event: { toolName: string, args: object, state: object }) => Promise<object | null> | object | null} [options.beforeToolCall]
  * @returns {Promise<void>}
  */
 export async function agentLoop(messages, options) {
-  const { ctx, state, onText, onToolStart, onToolEnd, onEvent, signal, tools, toolHandlers } = options
+  const { ctx, state, onText, onToolStart, onToolEnd, onEvent, signal, tools, toolHandlers, beforeToolCall } = options
   const traceSession = state?.traceSession || null
 
   const aiConfig = ctx.settings.aiConfig
@@ -66,6 +67,7 @@ export async function agentLoop(messages, options) {
       state,
       tools,
       toolHandlers,
+      beforeToolCall,
       signal,
       onGraphEvent(event) {
         if (signal?.aborted || !event?.type) return

@@ -1,6 +1,7 @@
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js'
 import DOMPurify from 'dompurify'
+import { getEditableAppTools } from '../../agent/tools/index.js'
 
 const markdown = new MarkdownIt({
   html: false,
@@ -371,6 +372,8 @@ export function renderCode(content, language = 'text') {
  * @returns {string}
  */
 export function getToolLabel(toolName, description = '') {
+  const customizedLabel = getEditableAppTools().find(tool => tool.name === toolName)?.label || ''
+  if (customizedLabel) return customizedLabel
   if (DEFAULT_TOOL_LABELS[toolName]) return DEFAULT_TOOL_LABELS[toolName]
 
   const cleaned = String(description || '').replace(/^对/, '').trim()

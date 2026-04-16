@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import DashboardView from './views/DashboardView.vue'
 import DevView from './views/DevView.vue'
+import ToolsView from './views/ToolsView.vue'
 import FloatingDock from './components/dock/FloatingDock.vue'
 import SettingsDrawer from './components/settings/SettingsDrawer.vue'
 import { initTheme } from './config'
@@ -51,6 +52,7 @@ onUnmounted(() => {
       <!-- 视图切换 -->
       <DashboardView v-if="currentView === 'dashboard'" />
       <DevView v-else-if="currentView === 'dev'" @navigate-home="currentView = 'dashboard'" />
+      <ToolsView v-else-if="currentView === 'tools'" />
     </div>
     
     <!-- 浮动 Dock (Dev 视图下隐藏) -->

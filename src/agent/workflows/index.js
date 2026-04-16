@@ -12,7 +12,15 @@ export const RELEASE_WORKFLOW = {
   id: 'release',
   mode: 'release',
   toolTags: ['base', 'release'],
-  promptFragment: '当前运行在 release workflow。优先推进版本、PR、预检和构建等发布步骤，但仍可在需要时使用通用基础工具。',
+  promptFragment: [
+    '当前运行在 release workflow。',
+    '如果当前已经存在 Release Session，用户输入“继续/下一步/好的”等中性消息时，视为继续当前发布会话。',
+    '先围绕当前 Release Session 推进步骤，不要跳过检查顺序。',
+    '推荐顺序：check_credentials -> fetch_jira_versions -> fetch_version_issues -> scan_pr_status -> run_preflight -> collect_config_changes -> collect_i18n_changes -> generate_i18n_artifacts -> generate_release_readiness_report。',
+    '只有在就绪报告通过且用户已在 Chat 中明确授权后，才允许继续执行 apply_config_changes / execute_release_merge / create_release_tag / publish_confluence_release_doc。',
+    '如遇 blocked 或 awaiting approval，优先解释状态、等待用户操作，不要擅自继续危险步骤。',
+    '不要把“当前步骤被闸门拦截”或“当前会话仍在发布流程中”错误表述成“工具无法调用”。'
+  ].join(' '),
   afterTool: handleReleaseToolEnd
 }
 

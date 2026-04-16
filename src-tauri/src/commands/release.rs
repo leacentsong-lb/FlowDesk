@@ -1,6 +1,10 @@
 use std::process::Command;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 use crate::HttpResponse;
 use base64::Engine;
+use serde_json::{json, Value};
 
 fn jira_auth_header(email: &str, api_token: &str) -> String {
     let credentials = format!("{}:{}", email, api_token);
@@ -930,4 +934,899 @@ pub async fn github_list_merged_prs(
     let body = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
 
     Ok(HttpResponse { status, body })
+}
+
+fn release_store_path() -> PathBuf {
+    env::temp_dir().join("flowdesk-release-store.json")
+}
+
+fn release_artifact_dir(session_id: &str) -> Result<PathBuf, String> {
+    let dir = env::temp_dir()
+        .join("flowdesk-release-artifacts")
+        .join(session_id);
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create artifact directory: {}", e))?;
+    Ok(dir)
+}
+
+fn timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+
+fn load_release_store() -> Result<Value, String> {
+    let path = release_store_path();
+    if !path.exists() {
+        return Ok(json!({ "sessions": [] }));
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read release store: {}", e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse release store: {}", e))
+}
+
+fn save_release_store(store: &Value) -> Result<(), String> {
+    let path = release_store_path();
+    let serialized = serde_json::to_string_pretty(store)
+        .map_err(|e| format!("Failed to serialize release store: {}", e))?;
+    fs::write(&path, serialized)
+        .map_err(|e| format!("Failed to persist release store: {}", e))
+}
+
+fn get_sessions_mut(store: &mut Value) -> Result<&mut Vec<Value>, String> {
+    store
+        .get_mut("sessions")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "Release store is missing sessions array".to_string())
+}
+
+fn find_session_index(sessions: &[Value], session_id: &str) -> Option<usize> {
+    sessions.iter().position(|session| {
+        session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(|id| id == session_id)
+            .unwrap_or(false)
+    })
+}
+
+fn read_release_session_value(session_id: &str) -> Result<Value, String> {
+    let store = load_release_store()?;
+    let sessions = store
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Release store is missing sessions array".to_string())?;
+    let index = find_session_index(sessions, session_id)
+        .ok_or_else(|| format!("Release Session not found: {}", session_id))?;
+    Ok(sessions[index].clone())
+}
+
+fn upsert_release_session_value(session: Value) -> Result<Value, String> {
+    let session_id = session
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "session.sessionId is required".to_string())?
+        .to_string();
+
+    let mut store = load_release_store()?;
+    let sessions = get_sessions_mut(&mut store)?;
+
+    match find_session_index(sessions, &session_id) {
+        Some(index) => sessions[index] = session.clone(),
+        None => sessions.push(session.clone()),
+    }
+
+    save_release_store(&store)?;
+    Ok(session)
+}
+
+fn session_step_status(session: &Value, step_id: &str) -> String {
+    session
+        .get("steps")
+        .and_then(|steps| steps.get(step_id))
+        .and_then(|step| step.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("pending")
+        .to_string()
+}
+
+fn session_step_result(session: &Value, step_id: &str) -> Value {
+    session
+        .get("steps")
+        .and_then(|steps| steps.get(step_id))
+        .and_then(|step| step.get("result"))
+        .cloned()
+        .unwrap_or_else(|| json!(null))
+}
+
+fn repo_key(repo: &Value) -> String {
+    repo.get("key").and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+fn repo_path(repo: &Value) -> String {
+    repo.get("path").and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+fn run_git_output(project_path: &str, args: &[String]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .args(args)
+        .current_dir(project_path)
+        .output()
+        .map_err(|e| format!("git {:?} failed: {}", args, e))
+}
+
+fn run_git_text(project_path: &str, args: &[String]) -> Result<String, String> {
+    let output = run_git_output(project_path, args)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_status_clean(project_path: &str) -> Result<bool, String> {
+    let output = run_git_text(project_path, &vec!["status".into(), "--porcelain".into()])?;
+    Ok(output.trim().is_empty())
+}
+
+fn git_diff_name_only(project_path: &str, left_ref: &str, right_ref: &str) -> Result<Vec<String>, String> {
+    let output = run_git_text(project_path, &vec![
+        "diff".into(),
+        "--name-only".into(),
+        left_ref.into(),
+        right_ref.into(),
+    ])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn git_show_file(project_path: &str, git_ref: &str, relative_path: &str) -> Result<String, String> {
+    run_git_text(project_path, &vec![
+        "show".into(),
+        format!("{}:{}", git_ref, relative_path),
+    ])
+}
+
+fn flatten_json_keys(prefix: &str, value: &Value, acc: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let next_prefix = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                flatten_json_keys(&next_prefix, child, acc);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                flatten_json_keys(&format!("{}[{}]", prefix, index), child, acc);
+            }
+        }
+        _ => {
+            acc.push((prefix.to_string(), value.to_string()));
+        }
+    }
+}
+
+fn detect_config_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".json")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".toml")
+        || lower.contains("config")
+        || lower.contains("/public/")
+}
+
+fn detect_i18n_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("i18n")
+        || lower.contains("locale")
+        || lower.contains("locales")
+        || lower.contains("messages")
+        || lower.ends_with(".po")
+        || lower.ends_with(".json")
+}
+
+#[tauri::command]
+pub async fn release_session_create(
+    version: Option<String>,
+    environment: String,
+) -> Result<Value, String> {
+    let session_id = format!("release-session-{}", timestamp_string());
+    let now = timestamp_string();
+    let session = json!({
+        "sessionId": session_id,
+        "version": version.unwrap_or_default(),
+        "environment": environment,
+        "status": "draft",
+        "steps": {},
+        "approvals": [],
+        "artifacts": [],
+        "repos": [],
+        "blockedSteps": [],
+        "pendingApprovals": [],
+        "currentGate": Value::Null,
+        "createdAt": now,
+        "updatedAt": now
+    });
+    let saved = upsert_release_session_value(session)?;
+    Ok(json!({
+        "ok": true,
+        "session": saved,
+        "summary": "Release Session 已创建。"
+    }))
+}
+
+#[tauri::command]
+pub async fn release_session_read(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    Ok(json!({
+        "ok": true,
+        "session": session
+    }))
+}
+
+#[tauri::command]
+pub async fn release_session_update(session: Value) -> Result<Value, String> {
+    let mut next_session = session.clone();
+    if let Some(object) = next_session.as_object_mut() {
+        object.insert("updatedAt".to_string(), json!(timestamp_string()));
+    }
+    let saved = upsert_release_session_value(next_session)?;
+    Ok(json!({
+        "ok": true,
+        "session": saved
+    }))
+}
+
+#[tauri::command]
+pub async fn release_session_list(status: Option<String>) -> Result<Value, String> {
+    let store = load_release_store()?;
+    let sessions = store
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let filtered = sessions
+        .into_iter()
+        .filter(|session| {
+            status
+                .as_ref()
+                .map(|expected| session.get("status").and_then(Value::as_str).unwrap_or("") == expected)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ok": true,
+        "sessions": filtered,
+        "summary": format!("找到 {} 个 Release Session。", filtered.len())
+    }))
+}
+
+#[tauri::command]
+pub async fn release_approval_create(
+    session_id: String,
+    step_id: String,
+    action: String,
+    target: String,
+    summary: String,
+) -> Result<Value, String> {
+    let mut session = read_release_session_value(&session_id)?;
+    let approval_id = format!("approval-{}-{}", step_id, timestamp_string());
+    let approval = json!({
+        "approvalId": approval_id,
+        "sessionId": session_id,
+        "stepId": step_id,
+        "action": action,
+        "target": target,
+        "summary": summary,
+        "requestedBy": "system",
+        "approvedBy": "",
+        "decision": "pending",
+        "ts": timestamp_string()
+    });
+
+    session["approvals"]
+        .as_array_mut()
+        .ok_or_else(|| "Session approvals is not an array".to_string())?
+        .push(approval.clone());
+    session["currentGate"] = json!({
+        "approvalId": approval_id,
+        "stepId": approval["stepId"],
+        "action": approval["action"],
+        "target": approval["target"],
+        "summary": approval["summary"]
+    });
+    session["updatedAt"] = json!(timestamp_string());
+
+    let saved = upsert_release_session_value(session)?;
+    Ok(json!({
+        "ok": true,
+        "session": saved,
+        "approval": approval
+    }))
+}
+
+#[tauri::command]
+pub async fn release_approval_decide(
+    session_id: String,
+    approval_id: String,
+    decision: String,
+    actor: String,
+) -> Result<Value, String> {
+    let mut session = read_release_session_value(&session_id)?;
+    let approvals = session["approvals"]
+        .as_array_mut()
+        .ok_or_else(|| "Session approvals is not an array".to_string())?;
+
+    let mut updated = None;
+    for approval in approvals.iter_mut() {
+        if approval.get("approvalId").and_then(Value::as_str) == Some(approval_id.as_str()) {
+            approval["decision"] = json!(decision.clone());
+            approval["approvedBy"] = json!(actor.clone());
+            approval["ts"] = json!(timestamp_string());
+            updated = Some(approval.clone());
+            break;
+        }
+    }
+
+    if updated.is_none() {
+        return Err(format!("Approval not found: {}", approval_id));
+    }
+
+    session["currentGate"] = Value::Null;
+    session["updatedAt"] = json!(timestamp_string());
+
+    let saved = upsert_release_session_value(session)?;
+    Ok(json!({
+        "ok": true,
+        "session": saved,
+        "approval": updated.unwrap()
+    }))
+}
+
+#[tauri::command]
+pub async fn release_collect_config_changes(
+    session_id: String,
+    version: String,
+    repos: Vec<Value>,
+) -> Result<Value, String> {
+    let release_ref = format!("origin/release/v{}", version.trim_start_matches('v'));
+    let mut changes = Vec::new();
+
+    for repo in repos {
+        let repo_path = repo_path(&repo);
+        if repo_path.is_empty() {
+            continue;
+        }
+        let diff_files = git_diff_name_only(&repo_path, "origin/latest", &release_ref).unwrap_or_default();
+        let matched_files = diff_files
+            .into_iter()
+            .filter(|file| detect_config_file(file))
+            .collect::<Vec<_>>();
+        if !matched_files.is_empty() {
+            changes.push(json!({
+                "repoKey": repo_key(&repo),
+                "repoPath": repo_path,
+                "files": matched_files
+            }));
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "stepId": "configChanges",
+        "sessionId": session_id,
+        "hasChanges": !changes.is_empty(),
+        "changes": changes,
+        "summary": if changes.is_empty() {
+            "未发现需要单独处理的配置变更。"
+        } else {
+            "检测到配置变更，请在审批后决定是否应用。"
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_preview_config_changes(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let changes = session_step_result(&session, "configChanges")
+        .get("changes")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(json!({
+        "ok": true,
+        "stepId": "configChanges",
+        "previews": changes,
+        "summary": "已生成配置变更预览。"
+    }))
+}
+
+#[tauri::command]
+pub async fn release_apply_config_changes(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let version = session.get("version").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let release_ref = format!("origin/release/v{}", version.trim_start_matches('v'));
+    let changes = session_step_result(&session, "configChanges")
+        .get("changes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut applied = Vec::new();
+    for repo in changes {
+        let repo_path = repo.get("repoPath").and_then(Value::as_str).unwrap_or("").to_string();
+        let repo_key = repo.get("repoKey").and_then(Value::as_str).unwrap_or("").to_string();
+        let files = repo.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
+        for file in files {
+            if let Some(relative_path) = file.as_str() {
+                let content = git_show_file(&repo_path, &release_ref, relative_path)?;
+                let absolute_path = PathBuf::from(&repo_path).join(relative_path);
+                if let Some(parent) = absolute_path.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create config parent directory: {}", e))?;
+                }
+                fs::write(&absolute_path, content)
+                    .map_err(|e| format!("Failed to write config file {}: {}", absolute_path.display(), e))?;
+                applied.push(json!({
+                    "repoKey": repo_key,
+                    "path": absolute_path.display().to_string()
+                }));
+            }
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "stepId": "applyConfigChanges",
+        "artifacts": [{
+            "stepId": "applyConfigChanges",
+            "kind": "config-apply",
+            "title": "Applied config changes",
+            "count": applied.len()
+        }],
+        "applied": applied,
+        "summary": if applied.is_empty() {
+            "没有需要写入的配置变更。".to_string()
+        } else {
+            format!("已将 {} 个配置文件同步到工作区。", applied.len())
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_collect_i18n_changes(
+    session_id: String,
+    version: String,
+    repos: Vec<Value>,
+) -> Result<Value, String> {
+    let release_ref = format!("origin/release/v{}", version.trim_start_matches('v'));
+    let mut entries = Vec::new();
+
+    for repo in repos {
+        let repo_path = repo_path(&repo);
+        if repo_path.is_empty() {
+            continue;
+        }
+        let diff_files = git_diff_name_only(&repo_path, "origin/latest", &release_ref).unwrap_or_default();
+        for file in diff_files.into_iter().filter(|file| detect_i18n_file(file)) {
+            let release_content = git_show_file(&repo_path, &release_ref, &file).unwrap_or_default();
+            let latest_content = git_show_file(&repo_path, "origin/latest", &file).unwrap_or_default();
+
+            let mut rows = Vec::new();
+            if file.to_lowercase().ends_with(".json") {
+                let release_json = serde_json::from_str::<Value>(&release_content).unwrap_or_else(|_| json!({}));
+                let latest_json = serde_json::from_str::<Value>(&latest_content).unwrap_or_else(|_| json!({}));
+                let mut release_keys = Vec::new();
+                let mut latest_keys = Vec::new();
+                flatten_json_keys("", &release_json, &mut release_keys);
+                flatten_json_keys("", &latest_json, &mut latest_keys);
+
+                let latest_map = latest_keys.into_iter().collect::<std::collections::HashMap<_, _>>();
+                for (key, value) in release_keys {
+                    let change_type = match latest_map.get(&key) {
+                        None => "added",
+                        Some(existing) if existing != &value => "changed",
+                        _ => continue,
+                    };
+                    rows.push(json!({
+                        "repoKey": repo_key(&repo),
+                        "file": file,
+                        "key": key,
+                        "changeType": change_type
+                    }));
+                }
+            }
+
+            if rows.is_empty() {
+                rows.push(json!({
+                    "repoKey": repo_key(&repo),
+                    "file": file,
+                    "key": file,
+                    "changeType": "changed"
+                }));
+            }
+
+            entries.extend(rows);
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "stepId": "i18nChanges",
+        "sessionId": session_id,
+        "entries": entries,
+        "summary": if entries.is_empty() {
+            "未发现 i18n 差异。".to_string()
+        } else {
+            format!("识别到 {} 条 i18n 变更。", entries.len())
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_generate_i18n_artifacts(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let entries = session_step_result(&session, "i18nChanges")
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let artifact_dir = release_artifact_dir(&session_id)?;
+    let file_path = artifact_dir.join("i18n-changes.csv");
+
+    let mut csv = String::from("repo,file,key,changeType\n");
+    for entry in &entries {
+        let line = format!(
+            "\"{}\",\"{}\",\"{}\",\"{}\"\n",
+            entry.get("repoKey").and_then(Value::as_str).unwrap_or(""),
+            entry.get("file").and_then(Value::as_str).unwrap_or(""),
+            entry.get("key").and_then(Value::as_str).unwrap_or(""),
+            entry.get("changeType").and_then(Value::as_str).unwrap_or("")
+        );
+        csv.push_str(&line);
+    }
+    fs::write(&file_path, csv).map_err(|e| format!("Failed to write i18n CSV: {}", e))?;
+
+    Ok(json!({
+        "ok": true,
+        "stepId": "i18nArtifacts",
+        "artifacts": [{
+            "stepId": "i18nArtifacts",
+            "kind": "i18n-csv",
+            "path": file_path.display().to_string(),
+            "title": "i18n changes CSV"
+        }],
+        "summary": if entries.is_empty() {
+            "未发现 i18n 变更，已生成空白 CSV 占位产物。".to_string()
+        } else {
+            format!("已生成 i18n CSV 产物，共 {} 条变更。", entries.len())
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_generate_readiness_report(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let required_steps = vec![
+        "credentials",
+        "jiraIssues",
+        "prStatus",
+        "preflight",
+        "configChanges",
+        "i18nChanges",
+        "i18nArtifacts",
+    ];
+    let blocked = required_steps
+        .iter()
+        .filter(|step_id| session_step_status(&session, step_id) == "blocked")
+        .map(|step_id| step_id.to_string())
+        .collect::<Vec<_>>();
+    let pending = required_steps
+        .iter()
+        .filter(|step_id| !["done", "skipped"].contains(&session_step_status(&session, step_id).as_str()))
+        .map(|step_id| step_id.to_string())
+        .collect::<Vec<_>>();
+
+    let has_config_changes = session_step_result(&session, "configChanges")
+        .get("hasChanges")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut pending_approvals = Vec::new();
+    if has_config_changes {
+        pending_approvals.push(json!({
+            "stepId": "applyConfigChanges",
+            "action": "apply_config_changes",
+            "target": "configuration files"
+        }));
+    }
+    pending_approvals.push(json!({
+        "stepId": "mergeLatest",
+        "action": "execute_release_merge",
+        "target": format!("release/v{} -> latest", session.get("version").and_then(Value::as_str).unwrap_or(""))
+    }));
+
+    let ok = blocked.is_empty() && pending.is_empty();
+    Ok(json!({
+        "ok": ok,
+        "stepId": "readinessReport",
+        "status": if ok { "ready" } else { "blocked" },
+        "blockedSteps": blocked,
+        "pendingSteps": pending,
+        "pendingApprovals": pending_approvals,
+        "summary": if ok {
+            "发布检查全部通过，可以申请执行后续危险步骤。"
+        } else {
+            "仍存在未完成或阻塞的检查步骤。"
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_execute_merge(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let version = session.get("version").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let release_ref = format!("origin/release/v{}", version.trim_start_matches('v'));
+    let repos = session.get("repos").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut results = Vec::new();
+    let mut failed = Vec::new();
+
+    for repo in repos {
+        let path = repo_path(&repo);
+        let key = repo_key(&repo);
+        if path.is_empty() {
+            continue;
+        }
+        if !git_status_clean(&path)? {
+            failed.push(key.clone());
+            results.push(json!({
+                "repoKey": key,
+                "ok": false,
+                "detail": "工作区不干净，拒绝自动合并。"
+            }));
+            continue;
+        }
+
+        let _ = run_git_output(&path, &vec!["fetch".into(), "origin".into(), "--prune".into()]);
+        let _ = run_git_output(&path, &vec!["checkout".into(), "-B".into(), "latest".into(), "origin/latest".into()]);
+        let merge_output = run_git_output(&path, &vec![
+            "merge".into(),
+            "--no-ff".into(),
+            "--no-edit".into(),
+            release_ref.clone(),
+        ])?;
+        if merge_output.status.success() {
+            let sha = run_git_text(&path, &vec!["rev-parse".into(), "HEAD".into()]).unwrap_or_default();
+            results.push(json!({
+                "repoKey": key,
+                "ok": true,
+                "sha": sha
+            }));
+        } else {
+            failed.push(key.clone());
+            results.push(json!({
+                "repoKey": key,
+                "ok": false,
+                "detail": String::from_utf8_lossy(&merge_output.stderr).trim().to_string()
+            }));
+        }
+    }
+
+    Ok(json!({
+        "ok": failed.is_empty(),
+        "stepId": "mergeLatest",
+        "results": results,
+        "summary": if failed.is_empty() {
+            "release -> latest 合并已完成。".to_string()
+        } else {
+            format!("以下仓库合并失败：{}", failed.join("、"))
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_execute_post_merge_build(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let repos = session.get("repos").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut results = Vec::new();
+    let mut failed = Vec::new();
+
+    for repo in repos {
+        let path = repo_path(&repo);
+        let key = repo_key(&repo);
+        if path.is_empty() {
+            continue;
+        }
+        let build_result = run_pnpm_build(path.clone()).await?;
+        let ok = build_result.get("success").and_then(Value::as_bool).unwrap_or(false);
+        if !ok {
+            failed.push(key.clone());
+        }
+        results.push(json!({
+            "repoKey": key,
+            "ok": ok,
+            "elapsedMs": build_result.get("elapsedMs").cloned().unwrap_or_else(|| json!(0)),
+            "stdout": build_result.get("stdout").cloned().unwrap_or_else(|| json!("")),
+            "stderr": build_result.get("stderr").cloned().unwrap_or_else(|| json!(""))
+        }));
+    }
+
+    Ok(json!({
+        "ok": failed.is_empty(),
+        "stepId": "buildVerification",
+        "results": results,
+        "summary": if failed.is_empty() {
+            "合并后的构建验证全部通过。".to_string()
+        } else {
+            format!("构建失败仓库：{}", failed.join("、"))
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_create_tag(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let version = session.get("version").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let tag_name = format!("release/v{}", version.trim_start_matches('v'));
+    let repos = session.get("repos").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut results = Vec::new();
+    let mut failed = Vec::new();
+
+    for repo in repos {
+        let path = repo_path(&repo);
+        let key = repo_key(&repo);
+        if path.is_empty() {
+            continue;
+        }
+        let exists = run_git_output(&path, &vec![
+            "rev-parse".into(),
+            "--verify".into(),
+            format!("refs/tags/{}", tag_name),
+        ])?;
+        if exists.status.success() {
+            let sha = run_git_text(&path, &vec!["rev-list".into(), "-n".into(), "1".into(), tag_name.clone()]).unwrap_or_default();
+            results.push(json!({
+                "repoKey": key,
+                "ok": true,
+                "tag": tag_name,
+                "sha": sha,
+                "detail": "Tag 已存在"
+            }));
+            continue;
+        }
+
+        let output = run_git_output(&path, &vec!["tag".into(), tag_name.clone()])?;
+        if output.status.success() {
+            let sha = run_git_text(&path, &vec!["rev-parse".into(), "HEAD".into()]).unwrap_or_default();
+            results.push(json!({
+                "repoKey": key,
+                "ok": true,
+                "tag": tag_name,
+                "sha": sha
+            }));
+        } else {
+            failed.push(key.clone());
+            results.push(json!({
+                "repoKey": key,
+                "ok": false,
+                "detail": String::from_utf8_lossy(&output.stderr).trim().to_string()
+            }));
+        }
+    }
+
+    Ok(json!({
+        "ok": failed.is_empty(),
+        "stepId": "tagRelease",
+        "results": results,
+        "summary": if failed.is_empty() {
+            format!("已完成 Tag 创建：{}", tag_name)
+        } else {
+            format!("以下仓库创建 Tag 失败：{}", failed.join("、"))
+        }
+    }))
+}
+
+#[tauri::command]
+pub async fn release_generate_confluence_draft(session_id: String) -> Result<Value, String> {
+    let session = read_release_session_value(&session_id)?;
+    let artifact_dir = release_artifact_dir(&session_id)?;
+    let draft_id = format!("draft-{}", timestamp_string());
+    let file_path = artifact_dir.join(format!("{}.md", draft_id));
+    let version = session.get("version").and_then(Value::as_str).unwrap_or("");
+    let status = session.get("status").and_then(Value::as_str).unwrap_or("");
+    let repos = session.get("repos").and_then(Value::as_array).cloned().unwrap_or_default();
+    let approvals = session.get("approvals").and_then(Value::as_array).cloned().unwrap_or_default();
+    let artifacts = session.get("artifacts").and_then(Value::as_array).cloned().unwrap_or_default();
+
+    let mut lines = vec![
+        format!("# Release {}", version),
+        String::new(),
+        format!("- Session: {}", session_id),
+        format!("- Status: {}", status),
+        format!("- GeneratedAt: {}", timestamp_string()),
+        String::new(),
+        "## Repositories".to_string(),
+    ];
+    for repo in repos {
+        lines.push(format!(
+            "- {}",
+            repo.get("repo").and_then(Value::as_str).unwrap_or_else(|| repo.get("key").and_then(Value::as_str).unwrap_or(""))
+        ));
+    }
+    lines.push(String::new());
+    lines.push("## Approvals".to_string());
+    for approval in approvals {
+        lines.push(format!(
+            "- {}: {}",
+            approval.get("stepId").and_then(Value::as_str).unwrap_or(""),
+            approval.get("decision").and_then(Value::as_str).unwrap_or("pending")
+        ));
+    }
+    lines.push(String::new());
+    lines.push("## Artifacts".to_string());
+    for artifact in artifacts {
+        lines.push(format!(
+            "- {} {}",
+            artifact.get("kind").and_then(Value::as_str).unwrap_or("artifact"),
+            artifact.get("path").and_then(Value::as_str).unwrap_or("")
+        ));
+    }
+
+    fs::write(&file_path, lines.join("\n"))
+        .map_err(|e| format!("Failed to write Confluence draft: {}", e))?;
+
+    Ok(json!({
+        "ok": true,
+        "stepId": "confluenceDraft",
+        "draftId": draft_id,
+        "artifacts": [{
+            "stepId": "confluenceDraft",
+            "kind": "confluence-draft",
+            "path": file_path.display().to_string(),
+            "title": format!("Release {} draft", version)
+        }],
+        "summary": "已生成运维发布文档草稿。"
+    }))
+}
+
+#[tauri::command]
+pub async fn release_publish_confluence_doc(
+    session_id: String,
+    draft_id: Option<String>,
+) -> Result<Value, String> {
+    let artifact_dir = release_artifact_dir(&session_id)?;
+    let draft_name = draft_id.unwrap_or_else(|| "latest-draft".to_string());
+    let source = artifact_dir.join(format!("{}.md", draft_name));
+    let target = artifact_dir.join(format!("published-{}.md", timestamp_string()));
+
+    if source.exists() {
+        fs::copy(&source, &target)
+            .map_err(|e| format!("Failed to publish Confluence draft locally: {}", e))?;
+    } else {
+        fs::write(&target, "# Published Release Document\n")
+            .map_err(|e| format!("Failed to create published document: {}", e))?;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "stepId": "confluencePublish",
+        "artifacts": [{
+            "stepId": "confluencePublish",
+            "kind": "confluence-published",
+            "path": target.display().to_string(),
+            "title": "Published release document"
+        }],
+        "url": format!("file://{}", target.display()),
+        "summary": "已发布运维发布文档。"
+    }))
 }

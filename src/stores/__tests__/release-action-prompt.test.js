@@ -5,6 +5,10 @@ const { mockAgentLoop } = vi.hoisted(() => ({
   mockAgentLoop: vi.fn()
 }))
 
+const { mockFetchJiraVersions } = vi.hoisted(() => ({
+  mockFetchJiraVersions: vi.fn()
+}))
+
 vi.mock('../../agent/index.js', () => ({
   agentLoop: mockAgentLoop,
   TOOLS: [
@@ -23,6 +27,17 @@ vi.mock('../../agent/index.js', () => ({
   ]
 }))
 
+vi.mock('../../agent/tools/index.js', async importOriginal => {
+  const actual = await importOriginal()
+  return {
+    ...actual,
+    TOOL_HANDLERS: {
+      ...actual.TOOL_HANDLERS,
+      fetch_jira_versions: mockFetchJiraVersions
+    }
+  }
+})
+
 import { useReleaseStore } from '../release'
 
 describe('release store action-first replies', () => {
@@ -30,6 +45,7 @@ describe('release store action-first replies', () => {
     localStorage.clear()
     setActivePinia(createPinia())
     mockAgentLoop.mockReset()
+    mockFetchJiraVersions.mockReset()
   })
 
   it('keeps only the docked version interaction and suppresses follow-up assistant text', async () => {
@@ -86,5 +102,48 @@ describe('release store action-first replies', () => {
     expect(compactTexts).toContain('Tool(run_preflight): 预检失败，请选择下一步操作。')
     expect(texts.join('\n')).not.toContain('检测到阻塞')
     expect(release.pendingInteraction.actions.some(action => action.id === 'retry-run_preflight')).toBe(true)
+  })
+
+  it('shows version-scope actions after credential checks and executes Jira fetch directly from the button', async () => {
+    mockAgentLoop.mockImplementationOnce(async (_messages, options) => {
+      options.onToolEnd?.('check_credentials', {
+        ok: true,
+        summary: '凭证已就绪。'
+      })
+
+      options.onText?.('凭证已就绪。接下来我会先获取 Jira 里的未发布版本，确认并绑定 3.8.2。')
+    })
+
+    mockFetchJiraVersions.mockResolvedValueOnce({
+      ok: true,
+      summary: '已获取可发布版本。',
+      versions: [
+        { name: '3.8.2' },
+        { name: '3.8.1' }
+      ]
+    })
+
+    const release = useReleaseStore()
+
+    await release.handleChatAction('mode-release-production')
+
+    expect(release.pendingInteraction).toMatchObject({
+      title: '凭证已就绪'
+    })
+    expect(release.pendingInteraction.actions.map(action => action.id)).toContain('fetch-jira-versions-unreleased')
+    expect(release.chatMessages.map(message => message.text).join('\n')).not.toContain('接下来我会先获取 Jira')
+
+    await release.handleChatAction('fetch-jira-versions-unreleased')
+
+    expect(mockFetchJiraVersions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        release_state: 'unreleased'
+      }),
+      expect.any(Object)
+    )
+    expect(release.pendingInteraction).toMatchObject({
+      title: '选择发布版本'
+    })
+    expect(release.pendingInteraction.actions.map(action => action.id)).toContain('version-3.8.2')
   })
 })

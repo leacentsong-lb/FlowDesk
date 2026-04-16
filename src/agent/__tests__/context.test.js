@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildSystemPrompt } from '../context.js'
+import { buildPromptMessages, buildSystemPrompt } from '../context.js'
 import { defaultSkillLoader } from '../skills.js'
 
 describe('agent context', () => {
@@ -116,6 +116,20 @@ describe('agent context', () => {
     expect(prompt).toContain('branch rules')
   })
 
+  it('injects a concise skill directory instead of only raw skill names', () => {
+    const prompt = buildSystemPrompt({
+      mode: 'general',
+      workspacePath: '/Users/demo/workspace'
+    })
+
+    expect(prompt).toContain('## Skills（可按需加载）')
+    expect(prompt).toContain('git-branching')
+    expect(prompt).toContain('Generate and execute a compliant commit message')
+    expect(prompt).toContain('workspace-topology')
+    expect(prompt).not.toContain('<skill name=')
+    expect(prompt).not.toContain('## Branch-Aware Commit Writer')
+  })
+
   it('injects memory summary into the system prompt when available', () => {
     const prompt = buildSystemPrompt({
       mode: 'general',
@@ -126,6 +140,35 @@ describe('agent context', () => {
 
     expect(prompt).toContain('## Memory')
     expect(prompt).toContain('Project memory: repo mapping already confirmed')
+  })
+
+  it('splits prompt messages into a stable prefix and a dynamic runtime context', () => {
+    const messages = buildPromptMessages({
+      mode: 'general',
+      workspacePath: '/Users/demo/workspace',
+      memorySummary: 'Project memory: repo mapping already confirmed',
+      primedSkillBundle: '<skill name="git-branching">branch rules</skill>',
+      availableTools: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_file',
+            description: '读取本地文件内容'
+          }
+        }
+      ]
+    })
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatchObject({ role: 'system' })
+    expect(messages[1]).toMatchObject({ role: 'system' })
+    expect(messages[0].content).toContain('你是开发助手')
+    expect(messages[0].content).not.toContain('当前工作区：/Users/demo/workspace')
+    expect(messages[0].content).not.toContain('Project memory')
+    expect(messages[1].content).toContain('当前工作区：/Users/demo/workspace')
+    expect(messages[1].content).toContain('Project memory: repo mapping already confirmed')
+    expect(messages[1].content).toContain('branch rules')
+    expect(messages[1].content).toContain('read_file')
   })
 
   it('supports prompt config overrides for role, workflow and response rules', () => {

@@ -43,4 +43,22 @@ describe('settings store', () => {
     expect(localStorage.getItem('ai_organization')).toBe('org_demo')
     expect(localStorage.getItem('ai_project')).toBe('proj_demo')
   })
+
+  it('stores web search provider config with Tavily defaults', () => {
+    const settings = useSettingsStore()
+
+    expect(settings.searchConfig.provider).toBe('tavily')
+    expect(settings.searchConfig.apiKey).toBe('')
+    expect(settings.searchConfigured).toBe(false)
+
+    settings.updateSearchConfig({
+      provider: 'tavily',
+      apiKey: 'tvly-test'
+    })
+
+    expect(settings.searchConfig.apiKey).toBe('tvly-test')
+    expect(settings.searchConfigured).toBe(true)
+    expect(localStorage.getItem('search_provider')).toBe('tavily')
+    expect(localStorage.getItem('search_api_key')).toBe('tvly-test')
+  })
 })

@@ -9,8 +9,8 @@ export function createAiClient() {
      * @param {object} payload
      * @returns {Promise<{ ok: boolean, message: string, status?: number }>}
      */
-    async testConnection(payload) {
-      const result = await postJson('/v1/test', payload)
+    async testConnection(payload, hooks) {
+      const result = await postJson('/v1/test', payload, hooks)
       return {
         ok: result.ok && result.body?.ok !== false,
         status: result.status,
@@ -22,8 +22,8 @@ export function createAiClient() {
      * @param {object} payload
      * @returns {Promise<any>}
      */
-    async complete(payload) {
-      const result = await postJson('/v1/chat/complete', payload)
+    async complete(payload, hooks) {
+      const result = await postJson('/v1/chat/complete', payload, hooks)
       if (!result.ok) {
         throw new Error(result.body?.message || `HTTP ${result.status}`)
       }
@@ -36,8 +36,8 @@ export function createAiClient() {
      * @param {AbortSignal} [signal]
      * @returns {Promise<void>}
      */
-    async streamAgent(payload, onEvent, signal) {
-      return streamEvents('/v1/agent/stream', payload, onEvent, signal)
+    async streamAgent(payload, onEvent, signal, hooks) {
+      return streamEvents('/v1/agent/stream', payload, onEvent, signal, hooks)
     }
   }
 }

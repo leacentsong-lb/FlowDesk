@@ -9,15 +9,28 @@ export const versionsSchema = {
   type: 'function',
   function: {
     name: 'fetch_jira_versions',
-    description: '从 Jira 获取当前项目所有未发布的版本列表。返回版本名称供选择。',
-    parameters: { type: 'object', properties: {}, required: [] }
+    description: '从 Jira 获取当前项目的版本列表。可按已发布、未发布或全部版本进行筛选，返回版本名称供选择。',
+    parameters: {
+      type: 'object',
+      properties: {
+        release_state: {
+          type: 'string',
+          enum: ['unreleased', 'released', 'all'],
+          description: '版本筛选条件。unreleased 表示未发布，released 表示已发布，all 表示全部。默认 unreleased。'
+        }
+      },
+      required: []
+    }
   }
 }
 
-export async function versionsHandler(_args, ctx) {
+export async function versionsHandler(args, ctx) {
   const jira = ctx.jira
   const projects = (jira.config.project || 'CRMCN').split('\n').map(p => p.trim()).filter(Boolean)
   const project = projects[0] || 'CRMCN'
+  const releaseState = ['unreleased', 'released', 'all'].includes(args?.release_state)
+    ? args.release_state
+    : 'unreleased'
 
   const result = await invoke('jira_get_versions', {
     domain: jira.config.domain,
@@ -32,16 +45,31 @@ export async function versionsHandler(_args, ctx) {
 
   const data = JSON.parse(result.body)
   const versions = (Array.isArray(data) ? data : [])
-    .filter(v => !v.archived && !v.released)
+    .filter(version => !version.archived)
+    .filter(version => {
+      if (releaseState === 'released') return version.released === true
+      if (releaseState === 'all') return true
+      return version.released !== true
+    })
     .sort((a, b) => (b.name || '').localeCompare(a.name || ''))
-    .map(v => ({ name: v.name, description: v.description || '' }))
+    .map(version => ({
+      name: version.name,
+      description: version.description || '',
+      released: Boolean(version.released)
+    }))
+
+  const summaryPrefix = releaseState === 'released'
+    ? '已发布版本'
+    : releaseState === 'all'
+      ? '全部版本'
+      : '待发布版本'
 
   return {
     ok: versions.length > 0,
     versions,
     summary: versions.length > 0
-      ? `找到 ${versions.length} 个待发布版本：${versions.slice(0, 5).map(v => v.name).join(', ')}`
-      : '未找到待发布版本'
+      ? `找到 ${versions.length} 个${summaryPrefix}：${versions.slice(0, 5).map(version => version.name).join(', ')}`
+      : `未找到${summaryPrefix}`
   }
 }
 

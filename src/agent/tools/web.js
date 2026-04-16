@@ -16,9 +16,11 @@ export const schema = {
   }
 }
 
-export async function handler(args) {
+export async function handler(args, ctx) {
   return invoke('agent_web_search', {
     query: args.query,
-    limit: args.limit || 5
+    limit: args.limit || 5,
+    provider: ctx?.settings?.searchConfig?.provider || 'tavily',
+    apiKey: ctx?.settings?.searchConfig?.apiKey || ''
   })
 }
