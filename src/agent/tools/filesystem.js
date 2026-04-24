@@ -11,11 +11,11 @@ export const readFileSchema = {
   type: 'function',
   function: {
     name: 'read_file',
-    description: '读取本地文件内容。可用于查看 package.json、配置文件、日志等。',
+    description: '读取本地文件内容。必须提供明确 path；如果还不知道文件路径，先用 list_directory、glob 或 scan_workspace_repos 定位后再调用。',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '文件的绝对路径或相对路径' },
+        path: { type: 'string', description: '文件的绝对路径或相对路径，例如 ./package.json；不能为空' },
         limit: { type: 'integer', description: '最多读取的行数（可选，默认读取全部）' }
       },
       required: ['path']
@@ -50,11 +50,11 @@ export const listDirSchema = {
   type: 'function',
   function: {
     name: 'list_directory',
-    description: '列出目录下的文件和子目录。可用于了解项目结构。',
+    description: '列出目录下的文件和子目录。传入明确 path，可用于先定位文件再读取。',
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '目录路径' }
+        path: { type: 'string', description: '目录路径，例如 .、src、/abs/path' }
       },
       required: ['path']
     }

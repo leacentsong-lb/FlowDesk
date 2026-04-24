@@ -6,6 +6,7 @@ import { recordTraceEvent } from './tracing.js'
 
 const MAX_ROUNDS = 20
 const MAX_CONSECUTIVE_TOOL_FAILURES = 2
+const MAX_RECOVERABLE_AUTO_RETRIES = 1
 const TOKEN_THRESHOLD = 80000
 
 const replace = (prev, next) => (next === undefined ? prev : next)
@@ -217,13 +218,16 @@ async function runToolsNode(graphState, runtimeConfig, options) {
           state
         })
       if (validationError) {
-        output = buildRecoverableValidationResult(fnName, validationError)
+        output = buildValidationResult(fnName, validationError, failureCounts, fnArgs)
       } else if (guardResult?.result) {
         output = guardResult.result
       } else if (!handler) {
         output = { error: `Unknown tool: ${fnName}` }
       } else {
-        output = await handler(fnArgs, ctx)
+        output = await handler(fnArgs, {
+          ...ctx,
+          state
+        })
       }
     } catch (error) {
       output = { error: `Tool "${fnName}" 执行出错: ${error?.message || error}` }
@@ -253,7 +257,7 @@ async function runToolsNode(graphState, runtimeConfig, options) {
       content: JSON.stringify(output)
     })
 
-    const failureInfo = trackToolFailure(failureCounts, fnName, fnArgs, toolStatus)
+    const failureInfo = trackToolFailure(failureCounts, fnName, fnArgs, toolStatus, output)
     if (failureInfo.shouldStop) {
       return {
         messages: nextMessages,
@@ -462,8 +466,30 @@ function resolveActiveToolHandlers(options, tools) {
   )
 }
 
-function buildRecoverableValidationResult(toolName, validationError) {
+function buildValidationResult(toolName, validationError, state, args) {
   const missingFields = Array.isArray(validationError?.missingFields) ? validationError.missingFields : []
+  const recoveryKey = `recover:${toolName}:${validationError?.code || 'validation_error'}:${stableStringify(args)}`
+  const attempts = (state[recoveryKey] || 0) + 1
+  state[recoveryKey] = attempts
+
+  if (attempts > MAX_RECOVERABLE_AUTO_RETRIES) {
+    return {
+      ok: false,
+      error: String(validationError?.message || '工具参数无效'),
+      summary: missingFields.length > 0
+        ? `自动补齐 ${missingFields.join(', ')} 未成功，请改为先定位路径或让模型决定下一步。`
+        : '自动修复参数未成功，请让模型决定下一步。',
+      recoverable: false,
+      recoveryKind: validationError?.code || 'validation_error',
+      recoveryAttempts: attempts,
+      toolName,
+      missingFields,
+      handoffToModel: true,
+      suggestion: missingFields.length > 0
+        ? `不要继续盲重试；请先用 list_directory / glob / scan_workspace_repos 定位路径，或直接向用户确认 ${missingFields.join(', ')}。`
+        : '不要继续盲重试；请让模型改用其他工具或先向用户确认缺失信息。'
+    }
+  }
 
   return {
     ok: false,
@@ -473,6 +499,7 @@ function buildRecoverableValidationResult(toolName, validationError) {
       : '参数格式不完整，Agent 正在自动调整后重试。',
     recoverable: true,
     recoveryKind: validationError?.code || 'validation_error',
+    recoveryAttempts: attempts,
     toolName,
     missingFields,
     suggestion: missingFields.length > 0
@@ -481,7 +508,11 @@ function buildRecoverableValidationResult(toolName, validationError) {
   }
 }
 
-function trackToolFailure(state, toolName, args, toolStatus) {
+function trackToolFailure(state, toolName, args, toolStatus, output) {
+  if (output?.handoffToModel) {
+    return { count: 0, shouldStop: false }
+  }
+
   const key = `${toolName}:${stableStringify(args)}`
 
   if (toolStatus !== 'error') {

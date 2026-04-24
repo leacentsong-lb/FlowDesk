@@ -16,6 +16,7 @@ const props = defineProps({
 
 const activeFilter = ref('all')
 const selectedEntryId = ref('')
+const copiedState = ref('')
 
 const traceSnapshot = computed(() => (props.trace ? snapshotTrace(props.trace) : null))
 const timeline = computed(() => buildTraceTimeline(traceSnapshot.value))
@@ -82,6 +83,25 @@ function getEntryTone(entry) {
   return 'muted'
 }
 
+async function copyEntry(entry) {
+  const content = entry ? formatJson(entry.raw) : ''
+  if (!content) return
+
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(content)
+    }
+    copiedState.value = entry.id
+    window.setTimeout(() => {
+      if (copiedState.value === entry.id) {
+        copiedState.value = ''
+      }
+    }, 1200)
+  } catch {
+    copiedState.value = ''
+  }
+}
+
 const filterOptions = [
   { id: 'all', label: '全部' },
   { id: 'ai', label: 'AI' },
@@ -143,8 +163,17 @@ const filterOptions = [
 
         <div class="trace-detail">
           <div v-if="selectedEntry" class="trace-detail-header">
-            <div class="trace-detail-title">{{ selectedEntry.label }}</div>
-            <div class="trace-detail-summary">{{ selectedEntry.summary }}</div>
+            <div class="trace-detail-copy">
+              <div class="trace-detail-title">{{ selectedEntry.label }}</div>
+              <div class="trace-detail-summary">{{ selectedEntry.summary }}</div>
+            </div>
+            <button
+              data-testid="trace-copy-btn"
+              class="trace-copy-btn"
+              @click="copyEntry(selectedEntry)"
+            >
+              {{ copiedState === selectedEntry.id ? '已复制' : '复制结果' }}
+            </button>
           </div>
           <pre v-if="selectedEntry" data-testid="trace-detail-json" class="trace-detail-json">{{ formatJson(selectedEntry.raw) }}</pre>
           <div v-else class="trace-empty">当前筛选下没有事件</div>
@@ -256,6 +285,40 @@ const filterOptions = [
   border-radius: 12px;
   border: 1px solid color-mix(in srgb, var(--glass-border) 88%, transparent);
   background: color-mix(in srgb, var(--bg-primary) 42%, transparent);
+}
+
+.trace-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 12px 0;
+}
+
+.trace-detail-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.trace-copy-btn {
+  flex-shrink: 0;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--glass-border) 84%, transparent);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.trace-copy-btn:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--glass-bg) 90%, transparent);
+  border-color: color-mix(in srgb, var(--glass-border-strong) 88%, transparent);
 }
 
 .trace-list {

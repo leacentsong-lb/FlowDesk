@@ -177,6 +177,84 @@ describe('agent loop invalid tool calls', () => {
     expect(onText).toHaveBeenCalledWith('我已经读取 package.json。')
   })
 
+  it('limits self-healing retries for missing params and lets the model choose the next step', async () => {
+    const messages = [{ role: 'user', content: '读一下 package.json' }]
+
+    let modelCallCount = 0
+    streamAgentMock.mockImplementation(async (payload, onEvent) => {
+      modelCallCount += 1
+
+      if (modelCallCount === 1) {
+        onEvent({
+          kind: 'tool-call-delta',
+          index: 0,
+          id: 'call_read_file_1',
+          name: 'read_file',
+          argumentsFragment: '{}'
+        })
+        onEvent({ kind: 'done', finishReason: 'tool_calls' })
+        return
+      }
+
+      if (modelCallCount === 2) {
+        const firstToolResult = JSON.parse(payload.messages.findLast(message => message.role === 'tool').content)
+        expect(firstToolResult).toMatchObject({
+          ok: false,
+          recoverable: true,
+          recoveryKind: 'missing_required_params',
+          missingFields: ['path']
+        })
+
+        onEvent({
+          kind: 'tool-call-delta',
+          index: 0,
+          id: 'call_read_file_2',
+          name: 'read_file',
+          argumentsFragment: '{}'
+        })
+        onEvent({ kind: 'done', finishReason: 'tool_calls' })
+        return
+      }
+
+      const exhaustedResult = JSON.parse(payload.messages.findLast(message => message.role === 'tool').content)
+      expect(exhaustedResult).toMatchObject({
+        ok: false,
+        recoverable: false,
+        recoveryKind: 'missing_required_params',
+        handoffToModel: true,
+        missingFields: ['path']
+      })
+
+      onEvent({ kind: 'text-delta', text: '我还缺少明确文件路径，先改为定位目录或请你确认具体文件。' })
+      onEvent({ kind: 'done', finishReason: 'stop' })
+    })
+
+    const onText = vi.fn()
+    await agentLoop(messages, {
+      ctx: {
+        settings: {
+          aiConfig: {
+            apiKey: 'test-key',
+            provider: 'openai',
+            model: 'gpt-test'
+          }
+        },
+        jira: {}
+      },
+      state: {
+        mode: 'general',
+        version: '',
+        environment: 'production',
+        completedTools: []
+      },
+      onText
+    })
+
+    expect(modelCallCount).toBe(3)
+    expect(readFileMock).not.toHaveBeenCalled()
+    expect(onText).toHaveBeenCalledWith('我还缺少明确文件路径，先改为定位目录或请你确认具体文件。')
+  })
+
   it('stops auto-retrying after the same non-recoverable tool fails twice consecutively', async () => {
     const messages = [{ role: 'user', content: '帮我执行 pwd' }]
     const onText = vi.fn()

@@ -1,9 +1,49 @@
 use std::process::{Command, Stdio};
 use std::{fs, path::{Path, PathBuf}};
 use std::thread;
-use std::time::Duration;
-use serde::Deserialize;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SkillScanRootRecord {
+    path: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct SkillLibraryRecord {
+    canonical_path: String,
+    source_path: String,
+    imported_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SkillInstallRecord {
+    skill_name: String,
+    scope: String,
+    installed_path: String,
+    link_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SkillsManifest {
+    version: u8,
+    scan_roots: Vec<SkillScanRootRecord>,
+    library: HashMap<String, SkillLibraryRecord>,
+    installs: Vec<SkillInstallRecord>,
+}
+
+impl Default for SkillsManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            scan_roots: Vec::new(),
+            library: HashMap::new(),
+            installs: Vec::new(),
+        }
+    }
+}
 
 /// Run a shell command in a specified directory.
 /// Safety: blocks dangerous patterns and scopes execution to the current workspace.
@@ -250,9 +290,14 @@ mod tests {
     use super::{
         agent_run_command,
         apply_exact_edit,
+        build_app_skill_catalog,
         build_search_queries,
         extract_duckduckgo_html_results,
+        import_skill_to_library_impl,
+        install_library_skill_to_app_impl,
         is_dangerous_command,
+        normalize_app_skill_raw,
+        parse_skill_frontmatter,
         resolve_command_scope,
         run_background_command,
         run_wait_command
@@ -267,6 +312,126 @@ mod tests {
         fs::create_dir_all(root.join("repo-a")).expect("create repo-a");
         fs::create_dir_all(root.join("nested/repo-b")).expect("create repo-b");
         root
+    }
+
+    fn write_skill(root: &PathBuf, relative_dir: &str, name: &str, description: &str) -> PathBuf {
+        let skill_dir = root.join(relative_dir);
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let skill_path = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_path,
+            format!(
+                "---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\nbody"
+            ),
+        )
+        .expect("write skill");
+        skill_path
+    }
+
+    #[test]
+    fn app_skill_catalog_prefers_workspace_over_global_repo_and_system() {
+        let root = std::env::temp_dir().join(format!("agent-skills-catalog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+
+        let workspace_root = root.join("workspace");
+        let global_root = root.join("global");
+        let repo_root = root.join("repo");
+        let system_root = root.join("system");
+
+        write_skill(&global_root, "release-flow", "release-flow", "global");
+        write_skill(&repo_root, "release-flow", "release-flow", "repo");
+        write_skill(&workspace_root, "release-flow", "release-flow", "workspace");
+        write_skill(&system_root, "git-branching", "git-branching", "system");
+
+        let catalog = build_app_skill_catalog(
+            Some(&workspace_root),
+            Some(&global_root),
+            Some(&repo_root),
+            Some(&system_root),
+        )
+        .expect("build catalog");
+
+        let release_flow = catalog
+            .iter()
+            .find(|item| item["name"].as_str() == Some("release-flow"))
+            .expect("release-flow exists");
+        assert_eq!(release_flow["sourceType"].as_str(), Some("workspace"));
+        assert_eq!(release_flow["writable"].as_bool(), Some(true));
+
+        let git_branching = catalog
+            .iter()
+            .find(|item| item["name"].as_str() == Some("git-branching"))
+            .expect("git-branching exists");
+        assert_eq!(git_branching["sourceType"].as_str(), Some("system"));
+        assert_eq!(git_branching["writable"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn import_and_install_library_skill_creates_app_entry() {
+        let root = std::env::temp_dir().join(format!("agent-skills-install-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+
+        let source_root = root.join("source");
+        let library_root = root.join("library");
+        let app_root = root.join("app");
+        let skill_path = write_skill(&source_root, "agent-design-guide", "agent-design-guide", "guide");
+
+        let imported = import_skill_to_library_impl(&skill_path, &library_root)
+            .expect("import to library");
+        assert!(PathBuf::from(imported["skill"]["canonicalPath"].as_str().unwrap()).exists());
+
+        let installed = install_library_skill_to_app_impl("agent-design-guide", &library_root, &app_root)
+            .expect("install to app");
+        assert!(PathBuf::from(installed["installedPath"].as_str().unwrap()).exists());
+    }
+
+    #[test]
+    fn normalize_app_skill_raw_preserves_enabled_flag() {
+        let raw = "---
+name: legacy-debug-skill
+description: 旧技能
+---
+
+# Legacy Debug Skill";
+        let normalized = normalize_app_skill_raw("legacy-debug-skill", raw, false)
+            .expect("normalize app skill raw");
+        let (meta, _) = parse_skill_frontmatter(&normalized);
+
+        assert_eq!(meta.get("name").map(String::as_str), Some("legacy-debug-skill"));
+        assert_eq!(meta.get("enabled").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn installed_app_skill_keeps_workspace_path_and_respects_link_mode() {
+        let root = std::env::temp_dir().join(format!("agent-skills-installed-catalog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+
+        let source_root = root.join("source");
+        let library_root = root.join("library");
+        let app_root = root.join("app");
+        let skill_path = write_skill(&source_root, "release-flow", "release-flow", "guide");
+
+        import_skill_to_library_impl(&skill_path, &library_root)
+            .expect("import to library");
+        let installed = install_library_skill_to_app_impl("release-flow", &library_root, &app_root)
+            .expect("install to app");
+
+        let catalog = build_app_skill_catalog(Some(&app_root), None, None, None)
+            .expect("build app skill catalog");
+        let release_flow = catalog
+            .iter()
+            .find(|item| item["name"].as_str() == Some("release-flow"))
+            .expect("release-flow exists");
+
+        let source_path = release_flow["sourcePath"].as_str().expect("source path");
+        assert!(source_path.starts_with(app_root.to_string_lossy().as_ref()));
+        assert_eq!(release_flow["sourceType"].as_str(), Some("workspace"));
+
+        let expected_writable = installed["linkType"].as_str() != Some("symlink");
+        assert_eq!(release_flow["writable"].as_bool(), Some(expected_writable));
     }
 
     #[test]
@@ -1099,6 +1264,381 @@ pub async fn agent_scan_skills(
 }
 
 #[tauri::command]
+pub async fn agent_discover_skills(
+    roots: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    agent_scan_skills(roots).await
+}
+
+#[tauri::command]
+pub async fn agent_get_skill_scan_roots() -> Result<serde_json::Value, String> {
+    let manifest = load_skills_manifest()?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "roots": manifest.scan_roots
+    }))
+}
+
+#[tauri::command]
+pub async fn agent_set_skill_scan_roots(
+    roots: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let mut manifest = load_skills_manifest()?;
+    manifest.scan_roots = roots
+        .into_iter()
+        .filter_map(|value| {
+            let path = value["path"].as_str()?.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(SkillScanRootRecord {
+                path,
+                enabled: value["enabled"].as_bool().unwrap_or(true),
+            })
+        })
+        .collect();
+    save_skills_manifest(&manifest)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "roots": manifest.scan_roots
+    }))
+}
+
+#[tauri::command]
+pub async fn agent_list_library_skills() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let library_root = resolve_central_skill_root();
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let manifest = load_skills_manifest().unwrap_or_default();
+
+        if library_root.exists() && library_root.is_dir() {
+            collect_skill_entries(&library_root, &library_root, &mut items, &mut seen)?;
+        }
+
+        let mut skills = items
+            .into_iter()
+            .map(|item| {
+                let name = item["name"].as_str().unwrap_or("").to_string();
+                let skill_path = item["skillPath"].as_str().unwrap_or("").to_string();
+                let record = manifest.library.get(&name);
+                let install_targets = manifest.installs
+                    .iter()
+                    .filter(|value| value.skill_name == name)
+                    .map(|value| serde_json::json!({
+                        "scope": value.scope,
+                        "installedPath": value.installed_path,
+                        "linkType": value.link_type,
+                    }))
+                    .collect::<Vec<_>>();
+                let installed_scopes = install_targets
+                    .iter()
+                    .filter_map(|value| value["scope"].as_str().map(|scope| scope.to_string()))
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "name": name,
+                    "title": item["title"].as_str().unwrap_or(""),
+                    "description": item["description"].as_str().unwrap_or(""),
+                    "canonicalPath": skill_path,
+                    "sourcePath": record.map(|value| value.source_path.clone()).unwrap_or_default(),
+                    "files": item["files"].clone(),
+                    "installedScopes": installed_scopes,
+                    "installTargets": install_targets,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        skills.sort_by(|left, right| {
+            left["title"].as_str().unwrap_or("").cmp(right["title"].as_str().unwrap_or(""))
+        });
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "skills": skills
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_import_skill_to_library(
+    skill_path: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let library_root = resolve_central_skill_root();
+        fs::create_dir_all(&library_root)
+            .map_err(|e| format!("Failed to create {}: {}", library_root.display(), e))?;
+        let result = import_skill_to_library_impl(Path::new(&skill_path), &library_root)?;
+        let mut manifest = load_skills_manifest()?;
+        let skill = &result["skill"];
+        let skill_name = skill["name"].as_str().unwrap_or("").to_string();
+        if !skill_name.is_empty() {
+            manifest.library.insert(skill_name, SkillLibraryRecord {
+                canonical_path: skill["canonicalPath"].as_str().unwrap_or("").to_string(),
+                source_path: skill["sourcePath"].as_str().unwrap_or("").to_string(),
+                imported_at: current_timestamp_string(),
+            });
+            save_skills_manifest(&manifest)?;
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_install_library_skill_to_app(
+    skill_name: String,
+    scope: String,
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let library_root = resolve_central_skill_root();
+        let app_root = match scope.as_str() {
+            "workspace" => resolve_workspace_app_skill_root(workspace_path.as_deref())
+                .ok_or_else(|| "workspacePath is required for workspace install".to_string())?,
+            _ => resolve_global_app_skill_root(),
+        };
+
+        let result = install_library_skill_to_app_impl(&skill_name, &library_root, &app_root)?;
+        let mut manifest = load_skills_manifest()?;
+        upsert_install_record(&mut manifest, SkillInstallRecord {
+            skill_name: skill_name.clone(),
+            scope: scope.clone(),
+            installed_path: result["installedPath"].as_str().unwrap_or("").to_string(),
+            link_type: result["linkType"].as_str().unwrap_or("copy").to_string(),
+        });
+        save_skills_manifest(&manifest)?;
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_uninstall_library_skill_from_app(
+    skill_name: String,
+    scope: String,
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_root = match scope.as_str() {
+            "workspace" => resolve_workspace_app_skill_root(workspace_path.as_deref())
+                .ok_or_else(|| "workspacePath is required for workspace uninstall".to_string())?,
+            _ => resolve_global_app_skill_root(),
+        };
+        let install_dir = app_root.join(&skill_name);
+        remove_path_if_exists(&install_dir)?;
+
+        let mut manifest = load_skills_manifest()?;
+        remove_install_record(&mut manifest, &skill_name, &scope);
+        save_skills_manifest(&manifest)?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "removed": true,
+            "scope": scope,
+            "skillName": skill_name,
+            "removedPath": install_dir.to_string_lossy().to_string()
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_migrate_app_skill_overrides(
+    overrides: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let global_root = resolve_global_app_skill_root();
+        fs::create_dir_all(&global_root)
+            .map_err(|e| format!("Failed to create {}: {}", global_root.display(), e))?;
+
+        let Some(entries) = overrides.as_object() else {
+            return Ok(serde_json::json!({
+                "ok": true,
+                "migrated": Vec::<String>::new(),
+                "skipped": Vec::<String>::new()
+            }));
+        };
+
+        let mut migrated = Vec::new();
+        let mut skipped = Vec::new();
+
+        for (raw_name, override_value) in entries {
+            let content = override_value.get("content").and_then(|value| value.as_str()).unwrap_or("").trim().to_string();
+            if content.is_empty() {
+                continue;
+            }
+            let enabled = override_value.get("enabled").and_then(|value| value.as_bool()).unwrap_or(true);
+            let skill_name = sanitize_skill_name(raw_name);
+            if skill_name.is_empty() {
+                continue;
+            }
+
+            let skill_dir = global_root.join(&skill_name);
+            if skill_dir.exists() {
+                skipped.push(skill_name);
+                continue;
+            }
+            fs::create_dir_all(&skill_dir)
+                .map_err(|e| format!("Failed to create {}: {}", skill_dir.display(), e))?;
+            let skill_path = skill_dir.join("SKILL.md");
+            let normalized = normalize_app_skill_raw(&skill_name, &content, enabled)?;
+            fs::write(&skill_path, normalized)
+                .map_err(|e| format!("Failed to write {}: {}", skill_path.display(), e))?;
+            migrated.push(skill_name);
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "migrated": migrated,
+            "skipped": skipped
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_list_app_skills(
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace_root = resolve_workspace_app_skill_root(workspace_path.as_deref());
+        let global_root = resolve_global_app_skill_root();
+        let repo_root = resolve_repo_app_skill_root();
+        let system_root = resolve_system_skill_root();
+        let items = build_app_skill_catalog(
+            workspace_root.as_deref(),
+            Some(global_root.as_path()),
+            Some(repo_root.as_path()),
+            Some(system_root.as_path()),
+        )?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "skills": items,
+            "count": items.len()
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_create_app_skill(
+    workspace_path: String,
+    base_name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace_root = resolve_workspace_app_skill_root(Some(workspace_path.as_str()))
+            .ok_or_else(|| "workspacePath is required".to_string())?;
+        fs::create_dir_all(&workspace_root)
+            .map_err(|e| format!("Failed to create {}: {}", workspace_root.display(), e))?;
+
+        let skill_name = ensure_unique_skill_name(
+            &workspace_root,
+            base_name.as_deref().unwrap_or("custom-debug-skill"),
+        );
+        let skill_dir = workspace_root.join(&skill_name);
+        fs::create_dir_all(&skill_dir)
+            .map_err(|e| format!("Failed to create {}: {}", skill_dir.display(), e))?;
+        let skill_path = skill_dir.join("SKILL.md");
+        fs::write(&skill_path, create_app_skill_template(&skill_name))
+            .map_err(|e| format!("Failed to write {}: {}", skill_path.display(), e))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "skill": build_app_skill_entry_from_path(&skill_path, "workspace", true)?
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_save_app_skill(
+    skill_path: String,
+    content: String,
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&skill_path);
+        resolve_app_skill_write_scope(&path, workspace_path.as_deref())?;
+        fs::write(&path, content.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "skillPath": skill_path
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_delete_app_skill(
+    skill_path: String,
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(&skill_path);
+        resolve_app_skill_write_scope(&path, workspace_path.as_deref())?;
+        let skill_dir = path.parent()
+            .ok_or_else(|| format!("Skill path has no parent: {}", path.display()))?;
+        remove_path_if_exists(skill_dir)?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "deletedPath": skill_dir.to_string_lossy().to_string()
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_copy_app_skill_to_workspace(
+    skill_path: String,
+    workspace_path: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source_skill = fs::canonicalize(&skill_path)
+            .map_err(|e| format!("Failed to canonicalize {}: {}", skill_path, e))?;
+        let source_dir = source_skill.parent()
+            .ok_or_else(|| format!("Skill path has no parent: {}", source_skill.display()))?;
+        let (_, _) = parse_skill_file(&source_skill)?;
+        let skill_name = sanitize_skill_name(
+            source_dir.file_name().and_then(|value| value.to_str()).unwrap_or("unknown-skill")
+        );
+        let workspace_root = resolve_workspace_app_skill_root(Some(workspace_path.as_str()))
+            .ok_or_else(|| "workspacePath is required".to_string())?;
+        fs::create_dir_all(&workspace_root)
+            .map_err(|e| format!("Failed to create {}: {}", workspace_root.display(), e))?;
+        let target_dir = workspace_root.join(&skill_name);
+        remove_path_if_exists(&target_dir)?;
+        copy_dir_all(source_dir, &target_dir)?;
+        let target_skill = target_dir.join("SKILL.md");
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "skillPath": target_skill.to_string_lossy().to_string()
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+#[tauri::command]
+pub async fn agent_scan_runtime_skills(
+    workspace_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    agent_list_app_skills(workspace_path).await
+}
+
+#[tauri::command]
 pub async fn agent_read_skill(
     skill_path: String,
 ) -> Result<serde_json::Value, String> {
@@ -1439,4 +1979,530 @@ fn should_skip_skill_scan_dir(name: &str) -> bool {
     }
 
     should_skip_dir(name)
+}
+
+fn resolve_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn resolve_flowdesk_home_dir() -> PathBuf {
+    resolve_home_dir().join(".flow-desk")
+}
+
+fn resolve_skills_manifest_path() -> PathBuf {
+    resolve_flowdesk_home_dir().join("skills-manifest.json")
+}
+
+fn resolve_central_skill_root() -> PathBuf {
+    resolve_flowdesk_home_dir().join("skills")
+}
+
+fn resolve_global_app_skill_root() -> PathBuf {
+    resolve_flowdesk_home_dir().join("app-skills")
+}
+
+fn resolve_workspace_app_skill_root(workspace_path: Option<&str>) -> Option<PathBuf> {
+    workspace_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| PathBuf::from(value).join(".flow-desk").join("app-skills"))
+}
+
+fn resolve_repo_app_skill_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let app_root = manifest_dir.parent().unwrap_or(manifest_dir.as_path());
+    app_root.join("app-skills")
+}
+
+fn resolve_system_skill_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let app_root = manifest_dir.parent().unwrap_or(manifest_dir.as_path());
+    app_root.join("src").join("agent").join("skills")
+}
+
+fn default_discover_roots() -> Vec<SkillScanRootRecord> {
+    let home = resolve_home_dir();
+    vec![
+        home.join("Documents"),
+        home.join("Desktop"),
+        home.join("Developer"),
+        home.join("projects"),
+        home.join("code"),
+        home.join("repos"),
+        home.join("work"),
+        home.join("src"),
+        PathBuf::from("/Applications"),
+    ]
+    .into_iter()
+    .map(|path| SkillScanRootRecord {
+        path: path.to_string_lossy().to_string(),
+        enabled: path.exists(),
+    })
+    .collect()
+}
+
+fn load_skills_manifest() -> Result<SkillsManifest, String> {
+    let manifest_path = resolve_skills_manifest_path();
+    if !manifest_path.exists() {
+        return Ok(SkillsManifest {
+            scan_roots: default_discover_roots(),
+            ..SkillsManifest::default()
+        });
+    }
+
+    let raw = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Failed to read {}: {}", manifest_path.display(), e))?;
+    let mut manifest: SkillsManifest = serde_json::from_str(&raw)
+        .map_err(|e| format!("Failed to parse {}: {}", manifest_path.display(), e))?;
+    if manifest.scan_roots.is_empty() {
+        manifest.scan_roots = default_discover_roots();
+    }
+    Ok(manifest)
+}
+
+fn save_skills_manifest(manifest: &SkillsManifest) -> Result<(), String> {
+    let manifest_path = resolve_skills_manifest_path();
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    let raw = serde_json::to_string_pretty(manifest)
+        .map_err(|e| format!("Failed to serialize skills manifest: {}", e))?;
+    fs::write(&manifest_path, raw)
+        .map_err(|e| format!("Failed to write {}: {}", manifest_path.display(), e))
+}
+
+fn current_timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn parse_skill_file(skill_path: &Path) -> Result<(HashMap<String, String>, String), String> {
+    let content = fs::read_to_string(skill_path)
+        .map_err(|e| format!("Failed to read {}: {}", skill_path.display(), e))?;
+    Ok(parse_skill_frontmatter(&content))
+}
+
+fn sanitize_skill_name(name: &str) -> String {
+    let normalized = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') { ch } else { '-' })
+        .collect::<String>();
+    normalized
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst)
+        .map_err(|e| format!("Failed to create {}: {}", dst.display(), e))?;
+
+    for entry in fs::read_dir(src)
+        .map_err(|e| format!("Failed to read {}: {}", src.display(), e))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read entry in {}: {}", src.display(), e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to inspect {}: {}", entry.path().display(), e))?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)
+                .map_err(|e| format!("Failed to copy {}: {}", target.display(), e))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_skill_file_paths(current: &Path, items: &mut Vec<PathBuf>) -> Result<(), String> {
+    let skill_path = current.join("SKILL.md");
+    if skill_path.is_file() {
+        items.push(skill_path);
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(current)
+        .map_err(|e| format!("Failed to scan {}: {}", current.to_string_lossy(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read entry in {}: {}", current.to_string_lossy(), e))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(file_type) = entry.file_type() else { continue };
+        let is_dir_like = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
+
+        if !is_dir_like || should_skip_skill_scan_dir(&name) {
+            continue;
+        }
+
+        collect_skill_file_paths(&path, items)?;
+    }
+
+    Ok(())
+}
+
+fn is_symlink_path(path: &Path) -> Result<bool, String> {
+    Ok(fs::symlink_metadata(path)
+        .map_err(|e| format!("Failed to inspect {}: {}", path.display(), e))?
+        .file_type()
+        .is_symlink())
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("Failed to inspect {}: {}", path.display(), e))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path)
+            .map_err(|e| format!("Failed to remove {}: {}", path.display(), e))?;
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|e| format!("Failed to remove {}: {}", path.display(), e))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn try_symlink_dir(src: &Path, dst: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(src, dst)
+        .map_err(|e| format!("Failed to create symlink {} -> {}: {}", dst.display(), src.display(), e))
+}
+
+#[cfg(not(unix))]
+fn try_symlink_dir(_src: &Path, _dst: &Path) -> Result<(), String> {
+    Err("symlink not supported on this platform".to_string())
+}
+
+fn upsert_install_record(manifest: &mut SkillsManifest, record: SkillInstallRecord) {
+    manifest.installs.retain(|item| !(item.skill_name == record.skill_name && item.scope == record.scope));
+    manifest.installs.push(record);
+}
+
+fn remove_install_record(manifest: &mut SkillsManifest, skill_name: &str, scope: &str) {
+    manifest.installs.retain(|item| !(item.skill_name == skill_name && item.scope == scope));
+}
+
+fn frontmatter_bool(meta: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    match meta.get(key).map(|value| value.trim().to_lowercase()) {
+        Some(value) if value == "false" || value == "0" || value == "no" => false,
+        Some(value) if value == "true" || value == "1" || value == "yes" => true,
+        Some(_) => default,
+        None => default,
+    }
+}
+
+fn normalize_app_skill_raw(name: &str, raw: &str, enabled: bool) -> Result<String, String> {
+    let (mut meta, body) = parse_skill_frontmatter(raw);
+    meta.insert("name".to_string(), name.to_string());
+    meta.insert("enabled".to_string(), if enabled { "true" } else { "false" }.to_string());
+
+    let mut lines = vec!["---".to_string()];
+    let mut keys = meta.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    if let Some(index) = keys.iter().position(|key| key == "name") {
+        let name_key = keys.remove(index);
+        keys.insert(0, name_key);
+    }
+    if let Some(index) = keys.iter().position(|key| key == "description") {
+        let description_key = keys.remove(index);
+        let insert_at = usize::min(1, keys.len());
+        keys.insert(insert_at, description_key);
+    }
+    if let Some(index) = keys.iter().position(|key| key == "enabled") {
+        let enabled_key = keys.remove(index);
+        let insert_at = usize::min(2, keys.len());
+        keys.insert(insert_at, enabled_key);
+    }
+    for key in keys {
+        if let Some(value) = meta.get(&key) {
+            lines.push(format!("{}: {}", key, value));
+        }
+    }
+    lines.push("---".to_string());
+    lines.push(String::new());
+    let normalized_body = body.trim().to_string();
+    if !normalized_body.is_empty() {
+        lines.push(normalized_body);
+    }
+    Ok(lines.join("\n"))
+}
+
+fn create_app_skill_template(name: &str) -> String {
+    [
+        "---",
+        &format!("name: {}", name),
+        "description: 请填写这个自定义技能的用途",
+        "enabled: true",
+        "---",
+        "",
+        "# 自定义技能",
+        "",
+        "## 适用场景",
+        "",
+        "- 什么时候应该使用这个技能？",
+        "- 它主要帮助 AI 解决什么问题？",
+        "",
+        "## 操作步骤",
+        "",
+        "1. 在这里写第 1 步。",
+        "2. 在这里写第 2 步。",
+        "",
+        "## 注意事项",
+        "",
+        "- 是否有不要使用它的场景？",
+        "- 是否有风险、前置条件或限制？",
+    ]
+    .join("\n")
+}
+
+fn ensure_unique_skill_name(root: &Path, base_name: &str) -> String {
+    let normalized = sanitize_skill_name(base_name);
+    if normalized.is_empty() {
+        return "custom-debug-skill".to_string();
+    }
+    if !root.join(&normalized).exists() {
+        return normalized;
+    }
+
+    let mut index = 2;
+    loop {
+        let candidate = format!("{}-{}", normalized, index);
+        if !root.join(&candidate).exists() {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn build_app_skill_entry_from_path(
+    skill_path: &Path,
+    source_type: &str,
+    writable: bool,
+) -> Result<serde_json::Value, String> {
+    let skill_dir = skill_path
+        .parent()
+        .ok_or_else(|| format!("Skill path has no parent: {}", skill_path.display()))?;
+    let content = fs::read_to_string(skill_path)
+        .map_err(|e| format!("Failed to read {}: {}", skill_path.display(), e))?;
+    let (meta, body) = parse_skill_frontmatter(&content);
+    let files = collect_skill_files(skill_dir)?;
+    let name = meta.get("name")
+        .cloned()
+        .unwrap_or_else(|| skill_dir.file_name().and_then(|value| value.to_str()).unwrap_or("unknown-skill").to_string());
+    let title = extract_skill_title(&body).unwrap_or_else(|| to_title_case(&name));
+    let enabled = frontmatter_bool(&meta, "enabled", true);
+
+    Ok(serde_json::json!({
+        "name": name,
+        "title": title,
+        "description": meta.get("description").cloned().unwrap_or_default(),
+        "sourceType": source_type,
+        "sourcePath": skill_path.to_string_lossy().to_string(),
+        "effectivePath": skill_path.to_string_lossy().to_string(),
+        "writable": writable,
+        "enabled": enabled,
+        "files": files,
+        "content": content
+    }))
+}
+
+fn path_within_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+fn resolve_app_skill_write_scope(
+    skill_path: &Path,
+    workspace_path: Option<&str>,
+) -> Result<(), String> {
+    let canonical = fs::canonicalize(skill_path)
+        .map_err(|e| format!("Failed to canonicalize {}: {}", skill_path.display(), e))?;
+    let global_root = resolve_global_app_skill_root();
+    if global_root.exists() {
+        let canonical_global = fs::canonicalize(&global_root)
+            .map_err(|e| format!("Failed to canonicalize {}: {}", global_root.display(), e))?;
+        if path_within_root(&canonical, &canonical_global) {
+            return Ok(());
+        }
+    }
+
+    let workspace_root = resolve_workspace_app_skill_root(workspace_path)
+        .ok_or_else(|| "workspacePath is required for workspace app skill mutation".to_string())?;
+    if workspace_root.exists() {
+        let canonical_workspace = fs::canonicalize(&workspace_root)
+            .map_err(|e| format!("Failed to canonicalize {}: {}", workspace_root.display(), e))?;
+        if path_within_root(&canonical, &canonical_workspace) {
+            return Ok(());
+        }
+    }
+
+    Err(format!("Refusing to mutate non-writable App Skill: {}", skill_path.display()))
+}
+
+pub fn import_skill_to_library_impl(skill_path: &Path, library_root: &Path) -> Result<serde_json::Value, String> {
+    let canonical_skill_path = fs::canonicalize(skill_path)
+        .map_err(|e| format!("Failed to canonicalize {}: {}", skill_path.display(), e))?;
+    if canonical_skill_path.file_name().and_then(|value| value.to_str()) != Some("SKILL.md") {
+        return Err(format!("Expected SKILL.md, got {}", canonical_skill_path.display()));
+    }
+
+    let (meta, body) = parse_skill_file(&canonical_skill_path)?;
+    let source_dir = canonical_skill_path
+        .parent()
+        .ok_or_else(|| format!("Skill path has no parent: {}", canonical_skill_path.display()))?;
+    let skill_name = sanitize_skill_name(
+        meta.get("name")
+            .map(String::as_str)
+            .unwrap_or_else(|| source_dir.file_name().and_then(|value| value.to_str()).unwrap_or("unknown-skill")),
+    );
+    if skill_name.is_empty() {
+        return Err("Skill name is required".to_string());
+    }
+
+    let canonical_dir = library_root.join(&skill_name);
+    if canonical_dir.exists() {
+        fs::remove_dir_all(&canonical_dir)
+            .map_err(|e| format!("Failed to replace {}: {}", canonical_dir.display(), e))?;
+    }
+    copy_dir_all(source_dir, &canonical_dir)?;
+    let canonical_skill_file = canonical_dir.join("SKILL.md");
+    let title = extract_skill_title(&body).unwrap_or_else(|| to_title_case(&skill_name));
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "skill": {
+            "name": skill_name,
+            "title": title,
+            "description": meta.get("description").cloned().unwrap_or_default(),
+            "canonicalPath": canonical_skill_file.to_string_lossy().to_string(),
+            "sourcePath": canonical_skill_path.to_string_lossy().to_string()
+        }
+    }))
+}
+
+pub fn install_library_skill_to_app_impl(
+    skill_name: &str,
+    library_root: &Path,
+    app_root: &Path,
+) -> Result<serde_json::Value, String> {
+    let canonical_dir = library_root.join(skill_name);
+    let canonical_skill = canonical_dir.join("SKILL.md");
+    if !canonical_skill.is_file() {
+        return Err(format!("Library skill does not exist: {}", canonical_skill.display()));
+    }
+
+    fs::create_dir_all(app_root)
+        .map_err(|e| format!("Failed to create {}: {}", app_root.display(), e))?;
+    let install_dir = app_root.join(skill_name);
+    if install_dir.exists() {
+        let metadata = fs::symlink_metadata(&install_dir)
+            .map_err(|e| format!("Failed to inspect {}: {}", install_dir.display(), e))?;
+        if metadata.file_type().is_symlink() || metadata.is_dir() {
+            fs::remove_dir_all(&install_dir)
+                .or_else(|_| fs::remove_file(&install_dir))
+                .map_err(|e| format!("Failed to clear {}: {}", install_dir.display(), e))?;
+        }
+    }
+
+    let link_type = match try_symlink_dir(&canonical_dir, &install_dir) {
+        Ok(_) => "symlink".to_string(),
+        Err(_) => {
+            copy_dir_all(&canonical_dir, &install_dir)?;
+            "copy".to_string()
+        }
+    };
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "installedPath": install_dir.to_string_lossy().to_string(),
+        "linkType": link_type
+    }))
+}
+
+fn build_catalog_entries(
+    root: Option<&Path>,
+    source_type: &str,
+    writable: bool,
+    catalog: &mut HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    if !root.exists() || !root.is_dir() {
+        return Ok(());
+    }
+
+    let mut skill_paths = Vec::new();
+    collect_skill_file_paths(root, &mut skill_paths)?;
+    skill_paths.sort();
+
+    for skill_path in skill_paths {
+        let content = fs::read_to_string(&skill_path)
+            .map_err(|e| format!("Failed to read {}: {}", skill_path.display(), e))?;
+        let (meta, body) = parse_skill_frontmatter(&content);
+        let skill_dir = skill_path
+            .parent()
+            .ok_or_else(|| format!("Skill path has no parent: {}", skill_path.display()))?;
+        let name = meta.get("name")
+            .cloned()
+            .unwrap_or_else(|| skill_dir.file_name().and_then(|value| value.to_str()).unwrap_or("unknown-skill").to_string());
+        if catalog.contains_key(&name) {
+            continue;
+        }
+        let files = collect_skill_files(skill_dir)?;
+        let title = extract_skill_title(&body).unwrap_or_else(|| to_title_case(&name));
+        let enabled = frontmatter_bool(&meta, "enabled", true);
+        let is_symlinked = is_symlink_path(&skill_path)? || is_symlink_path(skill_dir)?;
+        catalog.insert(
+            name.clone(),
+            serde_json::json!({
+                "name": name,
+                "title": title,
+                "description": meta.get("description").cloned().unwrap_or_default(),
+                "sourceType": source_type,
+                "sourcePath": skill_path.to_string_lossy().to_string(),
+                "effectivePath": skill_path.to_string_lossy().to_string(),
+                "writable": writable && !is_symlinked,
+                "enabled": enabled,
+                "files": files,
+                "content": content
+            }),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn build_app_skill_catalog(
+    workspace_root: Option<&Path>,
+    global_root: Option<&Path>,
+    repo_root: Option<&Path>,
+    system_root: Option<&Path>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut catalog = HashMap::new();
+    build_catalog_entries(workspace_root, "workspace", true, &mut catalog)?;
+    build_catalog_entries(global_root, "global", true, &mut catalog)?;
+    build_catalog_entries(repo_root, "repo", false, &mut catalog)?;
+    build_catalog_entries(system_root, "system", false, &mut catalog)?;
+
+    let mut items = catalog.into_values().collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        let left_name = left["title"].as_str().unwrap_or(left["name"].as_str().unwrap_or(""));
+        let right_name = right["title"].as_str().unwrap_or(right["name"].as_str().unwrap_or(""));
+        left_name.cmp(right_name)
+    });
+    Ok(items)
 }

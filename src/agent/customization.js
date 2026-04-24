@@ -76,6 +76,12 @@ export function resetAppSkillOverride(name) {
   updateRecord(APP_AGENT_SKILL_OVERRIDES_KEY, name, {}, normalizeSkillOverride)
 }
 
+export function clearAppSkillOverrides() {
+  const storage = getStorage()
+  if (!storage) return
+  storage.removeItem(APP_AGENT_SKILL_OVERRIDES_KEY)
+}
+
 export function loadAppToolOverrides() {
   return readJson(APP_AGENT_TOOL_OVERRIDES_KEY)
 }

@@ -8,6 +8,7 @@
  * - typewriter effect
  * - soft cancellation via AbortController + runId
  */
+import { invoke } from '@tauri-apps/api/core'
 import { computed, ref } from 'vue'
 import { agentLoop, getAllTools } from './index.js'
 import { loadAgentMemories } from './memory.js'
@@ -377,6 +378,16 @@ export function createAgentRuntime(options) {
     })
   }
 
+  function dismissToolMessage(toolName) {
+    const messageId = toolMessageIds.value[toolName]
+    if (!messageId) return
+
+    chatMessages.value = chatMessages.value.filter(message => message.id !== messageId)
+    const nextIds = { ...toolMessageIds.value }
+    delete nextIds[toolName]
+    toolMessageIds.value = nextIds
+  }
+
   /**
    * @param {object} result
    * @returns {void}
@@ -495,6 +506,7 @@ export function createAgentRuntime(options) {
       const memories = await loadAgentMemories({
         workspacePath: currentState.workspacePath
       })
+      const runtimeSkillCatalog = await loadRuntimeSkillCatalog(currentState.workspacePath)
 
       await agentLoop(agentMessages.value, {
         ctx,
@@ -507,6 +519,7 @@ export function createAgentRuntime(options) {
           availableTools: activeTools,
           memorySummary: memories.summary,
           memorySources: memories.sources,
+          runtimeSkillCatalog,
           primedSkillBundle: buildPrimedSkillBundle(),
           primedSkillNames: [...primedSkillContents.keys()],
           traceSession
@@ -589,6 +602,12 @@ export function createAgentRuntime(options) {
             }, {
               suppressNextAssistantText: true
             })
+          }
+
+          if (result?.recoverable && result?.recoveryKind === 'missing_required_params') {
+            dismissToolMessage(toolName)
+            onToolEnd?.({ toolName, result, toolStatus, runId })
+            return
           }
 
           pushToolMessage(toolName, toolStatus, summary, {
@@ -696,5 +715,16 @@ export function createAgentRuntime(options) {
     runAgent,
     stopAgentChat,
     resetRuntime
+  }
+}
+
+async function loadRuntimeSkillCatalog(workspacePath = '') {
+  try {
+    const result = await invoke('agent_list_app_skills', {
+      workspacePath: String(workspacePath || '').trim() || null
+    })
+    return Array.isArray(result?.skills) ? result.skills : []
+  } catch {
+    return []
   }
 }

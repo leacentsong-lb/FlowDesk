@@ -19,7 +19,9 @@ const userInput = ref('')
 const copiedState = ref('')
 
 const displayMessages = computed(() =>
-  (release.chatMessages || []).map(message => normalizeChatMessage(message))
+  (release.chatMessages || [])
+    .filter(message => !shouldHideMessage(message))
+    .map(message => normalizeChatMessage(message))
 )
 const activeTrace = computed(() => release.activeTrace || null)
 
@@ -66,6 +68,12 @@ function unwrapInteraction(value) {
 }
 
 const pendingInteraction = computed(() => unwrapInteraction(release.pendingInteraction))
+
+function shouldHideMessage(message) {
+  return message?.kind === 'tool' &&
+    message?.status === 'recovering' &&
+    message?.meta?.displayResult?.recoveryKind === 'missing_required_params'
+}
 
 /**
  * @returns {void}
@@ -260,6 +268,33 @@ function hasToolPayload(message) {
 
 /**
  * @param {object} message
+ * @returns {boolean}
+ */
+function canCopyMessage(message) {
+  return message?.kind !== 'tool' && message?.kind !== 'skill' && Boolean(String(message?.text || '').trim())
+}
+
+/**
+ * @param {object} message
+ * @returns {string}
+ */
+function getMessageCopyText(message) {
+  return String(message?.text || '').trim()
+}
+
+/**
+ * @param {object} message
+ * @returns {string}
+ */
+function getToolCopyText(message) {
+  if (message?.meta?.displayResult) {
+    return formatJson(message.meta.displayResult)
+  }
+  return String(message?.meta?.compactText || message?.text || '').trim()
+}
+
+/**
+ * @param {object} message
  * @returns {string}
  */
 function getActivityKind(message) {
@@ -412,6 +447,14 @@ onMounted(() => {
                   <span class="entry-author">Agent</span>
                   <span class="entry-separator">·</span>
                   <span class="entry-time">{{ formatTime(msg.ts) }}</span>
+                  <button
+                    v-if="canCopyMessage(msg)"
+                    data-testid="copy-message-btn"
+                    class="entry-copy-btn"
+                    @click="copyText(`message-${msg.id}`, getMessageCopyText(msg))"
+                  >
+                    {{ copiedState === `message-${msg.id}` ? '已复制' : '复制回复' }}
+                  </button>
                 </div>
 
                 <details v-if="msg._reasoning" class="reasoning-block">
@@ -432,8 +475,18 @@ onMounted(() => {
                   :data-activity-kind="getActivityKind(msg)"
                 >
                   <div class="activity-header">
-                    <span class="activity-badge" :class="`kind-${getActivityKind(msg)}`">{{ getActivityBadge(msg) }}</span>
-                    <span v-if="getActivityName(msg)" class="activity-name">{{ getActivityName(msg) }}</span>
+                    <div class="activity-meta">
+                      <span class="activity-badge" :class="`kind-${getActivityKind(msg)}`">{{ getActivityBadge(msg) }}</span>
+                      <span v-if="getActivityName(msg)" class="activity-name">{{ getActivityName(msg) }}</span>
+                    </div>
+                    <button
+                      v-if="getToolCopyText(msg)"
+                      data-testid="copy-tool-btn"
+                      class="entry-copy-btn"
+                      @click="copyText(`tool-${msg.id}`, getToolCopyText(msg))"
+                    >
+                      {{ copiedState === `tool-${msg.id}` ? '已复制' : '复制结果' }}
+                    </button>
                   </div>
                   <p class="tool-summary compact-tool-line">{{ msg.meta?.compactText || msg.text }}</p>
                   <details v-if="hasToolPayload(msg)" class="tool-details">
@@ -902,6 +955,25 @@ onMounted(() => {
   color: var(--text-tertiary);
 }
 
+.entry-copy-btn {
+  min-height: 22px;
+  padding: 0 8px;
+  margin-left: 4px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--glass-border) 84%, transparent);
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.entry-copy-btn:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--glass-bg) 90%, transparent);
+  border-color: color-mix(in srgb, var(--glass-border-strong) 88%, transparent);
+}
+
 .entry-author {
   font-weight: 700;
   color: var(--text-secondary);
@@ -977,6 +1049,14 @@ onMounted(() => {
 }
 
 .activity-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.activity-meta {
   display: flex;
   align-items: center;
   gap: 8px;

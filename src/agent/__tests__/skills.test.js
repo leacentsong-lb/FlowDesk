@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { defaultSkillLoader } from '../skills.js'
+import { defaultSkillLoader, getEditableAppSkills } from '../skills.js'
 
 describe('built-in skills', () => {
   beforeEach(() => {
@@ -71,5 +71,12 @@ describe('built-in skills', () => {
     expect(defaultSkillLoader.list()).toContain('custom-debug-skill')
     expect(defaultSkillLoader.load('custom-debug-skill')).toContain('Custom Debug Skill')
     expect(defaultSkillLoader.promptIndex()).toContain('custom-debug-skill')
+  })
+
+  it('sources release-flow from the app-skills catalog', () => {
+    const releaseFlow = getEditableAppSkills().find(skill => skill.name === 'release-flow')
+
+    expect(releaseFlow?.path).toContain('app-skills/release-flow/SKILL.md')
+    expect(defaultSkillLoader.load('release-flow')).toContain('发布流程规范')
   })
 })

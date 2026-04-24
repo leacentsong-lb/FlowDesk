@@ -13,7 +13,7 @@
  */
 
 import gitBranchingRaw from './skills/git-branching.md?raw'
-import releaseFlowRaw from './skills/release-flow.md?raw'
+import releaseFlowRaw from '../../app-skills/release-flow/SKILL.md?raw'
 import troubleshootingRaw from './skills/troubleshooting.md?raw'
 import workspaceTopologyRaw from './skills/workspace-topology.md?raw'
 import {
@@ -26,7 +26,7 @@ const BUILTIN_SKILLS = {}
 
 const skillFiles = {
   './skills/git-branching.md': gitBranchingRaw,
-  './skills/release-flow.md': releaseFlowRaw,
+  '../app-skills/release-flow/SKILL.md': releaseFlowRaw,
   './skills/troubleshooting.md': troubleshootingRaw,
   './skills/workspace-topology.md': workspaceTopologyRaw
 }
@@ -185,15 +185,48 @@ function createCustomSkillTemplate(name) {
   ].join('\n')
 }
 
+function normalizeSkillName(name, fallback = DEFAULT_CUSTOM_SKILL_BASENAME) {
+  const normalized = String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return normalized || fallback
+}
+
+function buildSkillRaw(name, meta = {}, body = '') {
+  const title = String(meta.title || '').trim()
+  const description = String(meta.description || '').trim()
+  const normalizedBody = String(body || '').trim()
+
+  return [
+    '---',
+    `name: ${name}`,
+    title ? `title: ${title}` : null,
+    description ? `description: ${description}` : null,
+    '---',
+    '',
+    normalizedBody
+  ].filter(Boolean).join('\n')
+}
+
+function renameSkillRaw(raw, nextName) {
+  const parsed = parseFrontmatter(raw)
+  return buildSkillRaw(nextName, parsed.meta, parsed.body)
+}
+
 function createUniqueSkillName(baseName = DEFAULT_CUSTOM_SKILL_BASENAME) {
+  const normalizedBaseName = normalizeSkillName(baseName)
   const catalog = resolveMergedSkillCatalog()
-  if (!catalog[baseName]) return baseName
+  if (!catalog[normalizedBaseName]) return normalizedBaseName
 
   let index = 2
-  while (catalog[`${baseName}-${index}`]) {
+  while (catalog[`${normalizedBaseName}-${index}`]) {
     index += 1
   }
-  return `${baseName}-${index}`
+  return `${normalizedBaseName}-${index}`
 }
 
 export function getEditableAppSkills() {
@@ -229,12 +262,77 @@ export function createEditableAppSkill(baseName = DEFAULT_CUSTOM_SKILL_BASENAME)
   }
 }
 
+export function importEditableAppSkill(content, options = {}) {
+  const parsed = parseFrontmatter(content)
+  const candidateName = options.baseName || parsed.meta.name || DEFAULT_CUSTOM_SKILL_BASENAME
+  const name = createUniqueSkillName(candidateName)
+  const raw = renameSkillRaw(content, name)
+
+  saveEditableAppSkill(name, {
+    content: raw,
+    enabled: options.enabled !== false
+  })
+
+  return {
+    name,
+    content: raw
+  }
+}
+
 export function saveEditableAppSkill(name, override) {
   saveAppSkillOverride(name, override)
 }
 
 export function resetEditableAppSkill(name) {
   resetAppSkillOverride(name)
+}
+
+export function renameEditableAppSkill(name, nextName, override = {}) {
+  const currentName = String(name || '').trim()
+  const requestedName = normalizeSkillName(nextName)
+  if (!currentName || !requestedName || currentName === requestedName) {
+    return {
+      name: currentName || requestedName,
+      renamed: false
+    }
+  }
+
+  const currentSkill = resolveMergedSkillCatalog()[currentName]
+  if (!currentSkill || currentSkill.builtIn === true) {
+    return {
+      name: currentName,
+      renamed: false
+    }
+  }
+
+  const targetName = createUniqueSkillName(requestedName)
+
+  const raw = typeof override.content === 'string' ? override.content : currentSkill.raw
+  saveEditableAppSkill(targetName, {
+    content: renameSkillRaw(raw, targetName),
+    enabled: override.enabled ?? currentSkill.enabled !== false
+  })
+  resetEditableAppSkill(currentName)
+
+  return {
+    name: targetName,
+    renamed: true
+  }
+}
+
+export function deleteEditableAppSkill(name) {
+  const skill = resolveMergedSkillCatalog()[String(name || '').trim()]
+  if (!skill || skill.builtIn === true) {
+    return {
+      deleted: false
+    }
+  }
+
+  resetEditableAppSkill(skill.name)
+  return {
+    deleted: true,
+    name: skill.name
+  }
 }
 
 function resolveMergedSkillCatalog() {

@@ -9,9 +9,10 @@
  *   ├── context.js        ← system prompt + compression
  *   ├── skills.js         ← SkillLoader (s05)
  *   ├── skills/           ← .md skill files
- *   │   ├── release-flow.md
  *   │   ├── git-branching.md
  *   │   └── troubleshooting.md
+ *   ├── ../app-skills/    ← App Skills defaults
+ *   │   └── release-flow/SKILL.md
  *   └── tools/
  *       ├── index.js      ← TOOL_HANDLERS + TOOLS (dispatch map + schemas)
  *       ├── command.js     ← run_command (bash equivalent)

@@ -6,9 +6,18 @@ import AgentChatPanel from '../AgentChatPanel.vue'
 import { useReleaseStore } from '../../../stores/release'
 
 describe('AgentChatPanel', () => {
+  let clipboardWriteText
+
   beforeEach(() => {
     localStorage.clear()
     setActivePinia(createPinia())
+    clipboardWriteText = vi.fn().mockResolvedValue()
+    Object.defineProperty(window.navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: clipboardWriteText
+      }
+    })
   })
 
   it('renders generic assistant copy by default', () => {
@@ -61,6 +70,53 @@ describe('AgentChatPanel', () => {
     expect(wrapper.find('[data-testid="copy-code-btn"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="json-block"]').exists()).toBe(true)
     expect(wrapper.text()).toContain('"status": "ok"')
+  })
+
+  it('renders and triggers copy for key agent replies and tool results', async () => {
+    const release = useReleaseStore()
+    vi.spyOn(release, 'agentStart').mockImplementation(() => {})
+
+    const wrapper = mount(AgentChatPanel)
+
+    release.chatMessages = [
+      {
+        id: 'agent-answer',
+        role: 'agent',
+        ts: new Date('2026-04-07T10:00:00Z'),
+        text: '链路检查完成，可以继续下一步。'
+      },
+      {
+        id: 'tool-result',
+        role: 'agent',
+        kind: 'tool',
+        status: 'success',
+        ts: new Date('2026-04-07T10:02:00Z'),
+        meta: {
+          toolLabel: '检查凭证',
+          toolName: 'check_credentials',
+          compactText: 'Tool(check_credentials): 凭证就绪',
+          displayResult: {
+            ok: true,
+            summary: '凭证就绪'
+          }
+        },
+        text: 'Tool(check_credentials): 凭证就绪'
+      }
+    ]
+
+    await nextTick()
+
+    expect(wrapper.find('[data-testid="copy-message-btn"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="copy-tool-btn"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="copy-message-btn"]').trigger('click')
+    expect(clipboardWriteText).toHaveBeenCalledWith('链路检查完成，可以继续下一步。')
+
+    await wrapper.get('[data-testid="copy-tool-btn"]').trigger('click')
+    expect(clipboardWriteText).toHaveBeenLastCalledWith(`{
+  "ok": true,
+  "summary": "凭证就绪"
+}`)
   })
 
   it('renders docked interactions above the composer and dispatches clicks through the store', async () => {
@@ -280,6 +336,45 @@ describe('AgentChatPanel', () => {
     expect(wrapper.text()).not.toContain('<skill name="release-flow">')
   })
 
+  it('hides self-healing missing-path tool retries from the chat timeline', async () => {
+    const release = useReleaseStore()
+    vi.spyOn(release, 'agentStart').mockImplementation(() => {})
+
+    const wrapper = mount(AgentChatPanel)
+
+    release.chatMessages = [
+      {
+        id: 'tool-read-file-recovering',
+        role: 'agent',
+        kind: 'tool',
+        status: 'recovering',
+        ts: new Date('2026-04-07T10:03:00Z'),
+        meta: {
+          toolLabel: '读取文件',
+          toolName: 'read_file',
+          displayResult: {
+            ok: false,
+            recoverable: true,
+            recoveryKind: 'missing_required_params',
+            summary: '参数不完整，Agent 正在自动补齐 path 后重试。'
+          }
+        },
+        text: '参数不完整，Agent 正在自动补齐 path 后重试。'
+      },
+      {
+        id: 'agent-followup',
+        role: 'agent',
+        ts: new Date('2026-04-07T10:03:30Z'),
+        text: '我先去定位正确文件路径。'
+      }
+    ]
+
+    await nextTick()
+
+    expect(wrapper.text()).not.toContain('参数不完整')
+    expect(wrapper.text()).toContain('我先去定位正确文件路径。')
+  })
+
   it('shows a stop button while the agent is running', async () => {
     const release = useReleaseStore()
     vi.spyOn(release, 'agentStart').mockImplementation(() => {})
@@ -361,6 +456,54 @@ describe('AgentChatPanel', () => {
     expect(wrapper.text()).toContain('工具完成')
     expect(wrapper.text()).toContain('链路检查完成。')
     expect(wrapper.find('[data-testid="trace-detail-json"]').text()).toContain('"model": "gpt-5.2"')
+  })
+
+  it('copies the selected trace detail payload', async () => {
+    const release = useReleaseStore()
+    vi.spyOn(release, 'agentStart').mockImplementation(() => {})
+
+    release.activeTrace = {
+      id: 'trace-1',
+      runId: 'run-1',
+      status: 'completed',
+      startedAt: '2026-04-15T10:00:00.000Z',
+      finishedAt: '2026-04-15T10:00:05.000Z',
+      events: [
+        {
+          type: 'model.call',
+          at: '2026-04-15T10:00:01.000Z',
+          provider: 'openai',
+          model: 'gpt-5.2',
+          messageCount: 3,
+          toolCount: 2,
+          request: {
+            messages: [{ role: 'user', content: '帮我分析链路' }]
+          }
+        }
+      ]
+    }
+
+    const wrapper = mount(AgentChatPanel)
+    await nextTick()
+
+    await wrapper.get('[data-testid="trace-copy-btn"]').trigger('click')
+
+    expect(clipboardWriteText).toHaveBeenCalledWith(`{
+  "type": "model.call",
+  "at": "2026-04-15T10:00:01.000Z",
+  "provider": "openai",
+  "model": "gpt-5.2",
+  "messageCount": 3,
+  "toolCount": 2,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "帮我分析链路"
+      }
+    ]
+  }
+}`)
   })
 
   it('does not send on Enter and updates the composer hint', async () => {

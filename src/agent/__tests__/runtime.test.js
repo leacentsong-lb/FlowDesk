@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveAgentWorkflow } from '../workflows/index.js'
+import { invoke } from '@tauri-apps/api/core'
 
 const { mockAgentLoop } = vi.hoisted(() => ({
   mockAgentLoop: vi.fn()
@@ -37,12 +38,18 @@ vi.mock('../memory.js', () => ({
   loadAgentMemories: mockLoadAgentMemories
 }))
 
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn()
+}))
+
 import { createAgentRuntime } from '../runtime.js'
 
 describe('agent runtime', () => {
   beforeEach(() => {
     mockAgentLoop.mockReset()
     mockLoadAgentMemories.mockReset()
+    invoke.mockReset()
+    invoke.mockResolvedValue({ ok: true, skills: [] })
     vi.useFakeTimers()
   })
 
@@ -139,6 +146,56 @@ describe('agent runtime', () => {
     expect(streamedMessage.role).toBe('agent')
     expect(streamedMessage.text).toBe('这是真实流式输出')
     expect(streamedMessage._streaming).toBe(false)
+  })
+
+  it('loads runtime app skills before each run so edited file skills can be used immediately', async () => {
+    mockLoadAgentMemories.mockResolvedValueOnce({
+      projectMemory: '',
+      userMemory: '',
+      summary: '',
+      sources: {
+        project: '/tmp/workspace/.flow-desk/AGENT.md',
+        user: '/Users/demo/.flow-desk/AGENT.md'
+      }
+    })
+    invoke.mockResolvedValueOnce({
+      ok: true,
+      skills: [
+        {
+          name: 'release-flow',
+          skillPath: '/tmp/app-skills/release-flow/SKILL.md'
+        }
+      ]
+    })
+
+    mockAgentLoop.mockImplementationOnce(async (_messages, options) => {
+      expect(options.state.runtimeSkillCatalog).toEqual([
+        {
+          name: 'release-flow',
+          skillPath: '/tmp/app-skills/release-flow/SKILL.md'
+        }
+      ])
+    })
+
+    const runtime = createAgentRuntime({
+      ctx: {
+        settings: { aiConfig: { apiKey: 'test-key' }, workspacePath: '/tmp/workspace' },
+        jira: {}
+      },
+      getState: () => ({
+        mode: 'general',
+        version: '',
+        environment: 'production',
+        completedTools: [],
+        workspacePath: '/tmp/workspace'
+      })
+    })
+
+    await runtime.runAgent('请检查运行时 skills。')
+
+    expect(invoke).toHaveBeenCalledWith('agent_list_app_skills', {
+      workspacePath: '/tmp/workspace'
+    })
   })
 
   it('renders the original user text when an internal sticky workflow prefix is used', async () => {
@@ -255,10 +312,7 @@ describe('agent runtime', () => {
 
     await runtime.runAgent('读一下 package.json')
 
-    const toolMessage = runtime.chatMessages.value.find(message => message.kind === 'tool')
-    expect(toolMessage.text).toContain('Agent 正在自动补齐后重试')
-    expect(toolMessage.status).toBe('recovering')
-    expect(toolMessage.actions || []).toHaveLength(0)
+    expect(runtime.chatMessages.value.at(-1)?.text).toContain('已自动')
   })
 
   it('merges repeated updates of the same tool into a single chat entry', async () => {
